@@ -24,21 +24,22 @@ def _wait_seconds(value: str) -> int:
 def make_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="rgrotate",
-        description="Inspect an RG Rotate PAC offline, or explicitly probe it using official RAM loaders.",
+        description="Inspect or probe an RG Rotate PAC, or install pinned Full firmware on a compatible layout.",
         epilog="Examples: rgrotate plan firmware.pac; rgrotate probe firmware.pac --out probe-report --backend build/spd_dump",
     )
     parser.add_argument("pac", type=Path, help="official RG Rotate PAC file")
     action = parser.add_mutually_exclusive_group()
     action.add_argument("--plan", action="store_true", help="offline plan (the default)")
     action.add_argument("--probe", action="store_true", help="load official FDLs into RAM and perform read-only checks")
-    action.add_argument("--flash", action="store_true", help="request writes; currently fails closed before USB access")
+    action.add_argument("--flash", action="store_true", help="explicitly request firmware writes")
     action.add_argument("--dump-xml", action="store_true", help="print PAC XML without opening USB")
     action.add_argument("--dump-firmware", action="store_true", help="request a read-only dump (not yet implemented)")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--full-flash", action="store_true", help="explicitly acknowledge the requested full-flash mode")
     mode.add_argument("--preserve-layout", action="store_true", help="request keeping the current partition table")
+    parser.add_argument("--wipe-data", action="store_true", help="authorize Recovery factory reset after verified Full installation")
     parser.add_argument("--backend", type=Path, help="path to the audited spd_dump executable")
-    parser.add_argument("--out", type=Path, help="new directory for probe results")
+    parser.add_argument("--out", type=Path, help="new private directory for results and full readback")
     parser.add_argument("--wait", type=_wait_seconds, default=30, help="USB discovery timeout, 1–30 seconds")
     parser.add_argument("--output-json", type=Path, help="also save the report to a new file; existing files are refused")
     return parser
@@ -74,10 +75,16 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--flash requires --full-flash or --preserve-layout")
     if (args.full_flash or args.preserve_layout) and not args.flash:
         parser.error("flash mode options require --flash")
+    if args.wipe_data and not (args.flash and args.preserve_layout):
+        parser.error("--wipe-data requires --flash --preserve-layout")
+    if args.flash and args.preserve_layout and not args.wipe_data:
+        parser.error("Full installation requires --wipe-data; preserving old user data is unsupported")
     if args.probe and (args.backend is None or args.out is None):
         parser.error("--probe requires --backend and --out")
-    if not args.probe and (args.backend is not None or args.out is not None):
-        parser.error("--backend and --out are accepted only for --probe")
+    if args.flash and args.preserve_layout and (args.backend is None or args.out is None):
+        parser.error("--flash --preserve-layout requires --backend and --out")
+    if not (args.probe or (args.flash and args.preserve_layout)) and (args.backend is not None or args.out is not None):
+        parser.error("--backend and --out require --probe or --flash --preserve-layout")
     if args.output_json is not None and args.output_json.exists():
         parser.error("--output-json must name a new file")
     try:
@@ -91,10 +98,14 @@ def main(argv: list[str] | None = None) -> int:
                 sys.stdout.write("\n")
             return 0
         if args.flash:
-            require_flash_ready(plan)
-            # This explicit terminal guard remains even if a caller changes
-            # the descriptive plan. No unvalidated write executor is imported.
-            raise PlanError("full-flash execution is not implemented in this release")
+            if args.full_flash:
+                require_flash_ready(plan)
+                raise PlanError("generic full-PAC execution is not implemented")
+            from .install import install
+
+            result = install(pac, args.out, args.backend, args.wait)
+            _report(result, args.output_json)
+            return 0
         if args.dump_firmware:
             raise PlanError("firmware dump is not implemented; no USB or storage write was attempted")
         if args.probe:

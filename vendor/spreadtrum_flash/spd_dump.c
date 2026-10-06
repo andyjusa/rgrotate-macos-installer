@@ -111,6 +111,26 @@ static uint64_t monotonic_ms(void) {
 	return (uint64_t)now.tv_sec * 1000 + (unsigned long)now.tv_nsec / 1000000;
 }
 
+typedef struct {
+	uint64_t bytes, time_ms;
+} transfer_progress_t;
+
+static void transfer_progress_at(transfer_progress_t *progress, const char *operation,
+		const char *name, uint64_t done, uint64_t total, uint64_t now) {
+	if (done && done != total && done - progress->bytes < 16 * 1024 * 1024 &&
+			now - progress->time_ms < 5000) return;
+	if (fprintf(stderr, "PROGRESS %s %s %llu %llu\n", operation, name,
+			(unsigned long long)done, (unsigned long long)total) < 0 || fflush(stderr))
+		ERR_EXIT("progress output failed\n");
+	progress->bytes = done;
+	progress->time_ms = now;
+}
+
+static void transfer_progress(transfer_progress_t *progress, const char *operation,
+		const char *name, uint64_t done, uint64_t total) {
+	transfer_progress_at(progress, operation, name, done, total, monotonic_ms());
+}
+
 #if USE_LIBUSB
 /* Count all matching devices before opening or changing any interface. */
 static libusb_device_handle *open_unique_device(void) {
@@ -623,9 +643,38 @@ static void check_confirm(const char *name) {
 		i = scanf("%3s%c", buf, &c);
 		if (i != 2 || c != '\n') break;
 		for (i = 0; buf[i]; i++) buf[i] = tolower(buf[i]);
-		if (!strcmp(buf, "yes")) return;
+		if (!strcmp(buf, "yes")) {
+			/* End the prompt line when stdin is a pipe (there is no terminal echo). */
+			if (putchar('\n') == EOF || fflush(stdout)) ERR_EXIT("confirmation output failed\n");
+			return;
+		}
 	} while (0);
 	ERR_EXIT("operation is not confirmed\n");
+}
+
+static void validate_checkpoint_token(const char *token) {
+	size_t i;
+	for (i = 0; token[i]; i++) {
+		unsigned char c = (unsigned char)token[i];
+		if (i >= 64 || !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+				(c >= '0' && c <= '9') || c == '_' || c == '-'))
+			ERR_EXIT("checkpoint token must be 1..64 ASCII letters, digits, '_' or '-'\n");
+	}
+	if (!i) ERR_EXIT("empty checkpoint token\n");
+}
+
+static void checkpoint(const char *token) {
+	char expected[75]; size_t i;
+	validate_checkpoint_token(token);
+	if (printf("CHECKPOINT %s\n", token) < 0 || fflush(stdout))
+		ERR_EXIT("checkpoint output failed\n");
+	snprintf(expected, sizeof(expected), "continue %s\n", token);
+	/* Consume exactly one line; never consume or approve a later yes prompt. */
+	for (i = 0; expected[i]; i++) {
+		int c = fgetc(stdin);
+		if (c == EOF) ERR_EXIT("checkpoint %s: stdin closed before continuation\n", token);
+		if (c != (unsigned char)expected[i]) ERR_EXIT("checkpoint %s: invalid continuation\n", token);
+	}
 }
 
 static uint8_t* loadfile(const char *fn, size_t *num, size_t extra) {
@@ -870,15 +919,19 @@ static uint64_t dump_partition(spdio_t *io,
 	uint32_t n, nread, t32; uint64_t offset, n64;
 	int ret, mode64;
 	FILE *fo;
+	transfer_progress_t progress = { 0, 0 };
+	int old_timeout = io->timeout;
 
 	if (!len || start > UINT64_MAX - len || !step || step > 0xffff)
 		ERR_EXIT("invalid partition read range/block size\n");
 	mode64 = start + len > UINT32_MAX;
 	select_partition(io, name, start + len, mode64, BSL_CMD_READ_START);
-	send_and_check(io);
+	send_and_check_timeout(io, 15000);
 
 	fo = fopen(fn, "wb");
 	if (!fo) ERR_EXIT("fopen(dump) failed\n");
+	transfer_progress(&progress, "read", name, 0, len);
+	io->timeout = 15000;
 
 	for (offset = start; (n64 = start + len - offset); ) {
 		uint32_t data[3];
@@ -900,7 +953,7 @@ static uint64_t dump_partition(spdio_t *io,
 		if (fwrite(io->raw_buf + 4, 1, nread, fo) != nread) 
 			ERR_EXIT("fwrite(dump) failed\n");
 		offset += nread;
-
+		if (offset - start < len) transfer_progress(&progress, "read", name, offset - start, len);
 	}
 	DBG_LOG("dump_partition: %s+0x%llx, target: 0x%llx, read: 0x%llx\n",
 			name, (long long)start, (long long)len,
@@ -908,7 +961,9 @@ static uint64_t dump_partition(spdio_t *io,
 	if (fclose(fo)) ERR_EXIT("output close failed\n");
 
 	encode_msg(io, BSL_CMD_READ_END, NULL, 0);
-	send_and_check(io);
+	send_and_check_timeout(io, 120000);
+	io->timeout = old_timeout;
+	transfer_progress(&progress, "read", name, len, len);
 	return offset;
 }
 
@@ -1064,9 +1119,10 @@ static void erase_partition(spdio_t *io, const char *name) {
 static void load_partition(spdio_t *io, const char *name,
 		const char *fn, unsigned step) {
 	uint64_t offset, len, n64;
-	unsigned mode64, n; int ret;
+	unsigned mode64, n;
 	off_t file_len;
 	FILE *fi;
+	transfer_progress_t progress = { 0, 0 };
 
 	fi = fopen(fn, "rb");
 	if (!fi) ERR_EXIT("fopen(load) failed\n");
@@ -1081,23 +1137,22 @@ static void load_partition(spdio_t *io, const char *name,
 	check_confirm("write partition");
 	select_partition(io, name, len, mode64, BSL_CMD_START_DATA);
 	send_and_check_timeout(io, 15000);
+	transfer_progress(&progress, "write", name, 0, len);
 
 	for (offset = 0; (n64 = len - offset); offset += n) {
 		n = n64 > step ? step : n64;
 		if (fread(io->temp_buf, 1, n, fi) != n) 
 			ERR_EXIT("fread(load) failed\n");
 		encode_msg(io, BSL_CMD_MIDST_DATA, io->temp_buf, n);
-		send_msg(io);
-		ret = recv_msg_timeout(io, 15000);
-		if (!ret) ERR_EXIT("timeout reached\n");
-		if ((ret = recv_type(io)) != BSL_REP_ACK)
-			ERR_EXIT("unexpected response (0x%04x); write aborted\n", ret);
+		send_and_check_timeout(io, 15000);
+		if (offset + n < len) transfer_progress(&progress, "write", name, offset + n, len);
 	}
 	DBG_LOG("load_partition: %s, target: 0x%llx, written: 0x%llx\n",
 			name, (long long)len, (long long)offset);
 	fclose(fi);
 	encode_msg(io, BSL_CMD_END_DATA, NULL, 0);
 	send_and_check_timeout(io, 120000);
+	transfer_progress(&progress, "write", name, len, len);
 }
 
 static int64_t find_partition_size(spdio_t *io, const char *name) {
@@ -1262,7 +1317,8 @@ static void validate_readonly_commands(int argc, char **argv) {
 		if (!strcmp(command, "fdl")) args = 2;
 		else if (!strcmp(command, "read_part")) args = 4;
 		else if (!strcmp(command, "partition_list") || !strcmp(command, "partition_list_4k") ||
-			!strcmp(command, "blk_size") || !strcmp(command, "timeout") || !strcmp(command, "verbose")) args = 1;
+			!strcmp(command, "blk_size") || !strcmp(command, "timeout") || !strcmp(command, "verbose") ||
+			!strcmp(command, "checkpoint")) args = 1;
 		else if (!strcmp(command, "disable_transcode") || !strcmp(command, "power_off")) args = 0;
 		else ERR_EXIT("--read-only forbids command: %s\n", command);
 		if (argc - pos <= args) ERR_EXIT("missing arguments for %s\n", command);
@@ -1277,6 +1333,7 @@ static void validate_readonly_commands(int argc, char **argv) {
 			if (!size || size > 0xffff) ERR_EXIT("invalid block size\n");
 		} else if (!strcmp(command, "timeout")) bounded_decimal(argv[pos + 1], 1, 120000);
 		else if (!strcmp(command, "verbose")) bounded_decimal(argv[pos + 1], 0, 2);
+		else if (!strcmp(command, "checkpoint")) validate_checkpoint_token(argv[pos + 1]);
 		pos += args + 1;
 	}
 	if (argc < 2) ERR_EXIT("no read-only commands supplied\n");
@@ -1468,6 +1525,11 @@ int main(int argc, char **argv) {
 
 			fdl_loaded++;
 			argc -= 3; argv += 3;
+
+		} else if (!strcmp(argv[1], "checkpoint")) {
+			if (argc <= 2) ERR_EXIT("bad checkpoint command\n");
+			checkpoint(argv[2]);
+			argc -= 2; argv += 2;
 
 		} else if (!strcmp(argv[1], "read_flash")) {
 			const char *fn; uint64_t addr, offset, size;

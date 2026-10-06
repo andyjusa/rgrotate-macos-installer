@@ -180,6 +180,20 @@ class CliIsolationTests(unittest.TestCase):
              patch("sys.stderr", new_callable=io.StringIO):
             self.assertEqual(main(["dump-firmware", "synthetic.pac"]), 2)
 
+    def test_clean_install_requires_explicit_wipe_and_output(self):
+        from rgrotate.cli import main
+        cases = [
+            ['flash', 'synthetic.pac', '--flash', '--preserve-layout'],
+            ['flash', 'synthetic.pac', '--flash', '--preserve-layout', '--wipe-data'],
+            ['plan', 'synthetic.pac', '--wipe-data'],
+            ['probe', 'synthetic.pac', '--wipe-data'],
+        ]
+        for args in cases:
+            with self.subTest(args=args), patch('rgrotate.cli.PacFile') as opened, \
+                 patch('sys.stderr', new_callable=io.StringIO), self.assertRaises(SystemExit):
+                main(args)
+            opened.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

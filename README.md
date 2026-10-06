@@ -4,10 +4,10 @@ Community tooling for using an Anbernic RG Rotate PAC firmware package on macOS.
 This project follows the Unisoc BootROM/FDL transport used by PAC installers.
 It is independent of Anbernic and GammaOS and is not an official macOS release.
 
-**Development preview: inspection and read-only probing are being validated.
-Full firmware installation is blocked until the complete write and recovery
-workflow has been verified. Do not treat a successful build or PAC inspection
-as proof that a device can be safely flashed.**
+**Development preview: native macOS BootROM/FDL communication and the read-only
+probe have succeeded on an RG Rotate. A narrowly scoped clean Full conversion
+is experimental; its storage writes and first-boot recovery reset have
+not yet been verified on hardware.**
 
 ## Current capabilities
 
@@ -47,7 +47,7 @@ Obtain your own firmware from the
 
 Validated on Apple Silicon macOS during development:
 
-- 43 Python tests, including comparison of all 71 entries in the 6.67 GB
+- Offline Python regressions, including comparison of all 71 entries in the 6.67 GB
   GammaOS Full v1.4.1 PAC with an independent manifest.
 - Native backend build with warnings treated as errors.
 - Mock USB/protocol tests under AddressSanitizer and UndefinedBehaviorSanitizer:
@@ -55,10 +55,14 @@ Validated on Apple Silicon macOS during development:
   multiple-device rejection, and streaming failures.
 - Offline command classification accepts the probe sequence and rejects a
   destructive command under `--read-only` before USB initialization.
+- Actual BootROM/FDL loader execution, partition-table retrieval, and a bounded
+  `boot_a` read through the native macOS backend on an RG Rotate.
 
-Actual BootROM/FDL communication and a full installation on RG Rotate remain
-unverified. Firmware integration tests require local `RGROTATE_TEST_PAC` and
-`RGROTATE_TEST_MANIFEST` paths; those inputs are not distributed.
+The clean Full conversion's storage-write sequence, complete image readbacks,
+and recovery factory reset remain unverified on hardware. A successful probe
+does not establish those outcomes. Firmware integration tests require local
+`RGROTATE_TEST_PAC` and `RGROTATE_TEST_MANIFEST` paths; those inputs are not
+distributed.
 
 ## Read-only USB probe
 
@@ -77,6 +81,63 @@ See the model-specific
 The output directory contains loader copies, probe logs, the partition table,
 and the boot sample. Keep it private. A failure stops the operation; the program
 does not automatically reconnect or retry a write.
+
+## Clean Full conversion (experimental)
+
+The experimental installation path targets the official **GammaOS Next
+v1.4.1 Full PAC** and an RG Rotate with a compatible existing boot chain and
+partition layout. It keeps the existing GPT, NV/calibration data, and compatible
+boot-chain images, then performs this bounded sequence through the PAC's FDLs:
+
+1. Write the PAC's raw `full_super.img` to `super` and read the complete written
+   image back for a SHA-256 comparison.
+2. Write the four A-side vbmeta images and verify each complete readback.
+3. Read the current `misc` image and change only its recovery command fields to
+   request `recovery --wipe_data`, preserving the remaining bytes. Write and
+   verify the complete patched image.
+4. Power off. The next boot is requested to enter recovery and perform the
+   factory reset; that boot outcome still needs hardware verification.
+
+Use a new output directory. An existing directory is refused, so an interrupted
+run cannot silently overwrite its pre-write backups or verification evidence.
+
+```sh
+python3 -m rgrotate flash /path/to/official-v1.4.1-full.pac \
+  --flash --preserve-layout --wipe-data \
+  --backend ./build/spd_dump --out ./runs/install-001 --wait 30
+```
+
+Keep the device disconnected while the tool checks the pinned Full images,
+extracts them locally, and checks space for complete readback files. Connect in
+the model-specific BootROM mode above when the tool reports that it is waiting.
+All three options `--flash --preserve-layout --wipe-data` are required for this
+installation path.
+
+Before the first write, the runner reads the device partition table, compatible
+boot-chain images, current `misc`, and device-specific NV/calibration regions.
+It also reads a 1 MiB range of `super` at an offset above 4 GiB to exercise the
+device's 64-bit read path. The preflight validator must accept these results
+before any write confirmation is sent.
+
+Every write is followed by a complete size and SHA-256 check of its readback.
+Only then is the next write allowed. The output directory contains private
+pre-write backups, extracted images, full readbacks, `install.log`,
+`progress.json`, and an atomically updated `install-result.json`. A failure
+stops the connection; there is no automatic retry, reconnect, or reset.
+
+`storage_verified_awaiting_recovery_boot` means the written images were read
+back successfully and power-off was acknowledged. It does not mean Android
+booted or the factory reset finished. The result keeps `boot_verified` false
+until that separate outcome has been checked.
+
+This is a targeted Full conversion over native macOS FDL. It does not replay
+the Windows installer's complete PAC operation sequence or repartition the
+device. Generic `--full-flash` execution is unsupported.
+
+The explicit wipe request removes user data, games stored in userdata, saves,
+and settings. The installer does not restore them. The hardware write and
+first-boot reset workflow must still be validated before this path can be
+described as a verified installer.
 
 ## Why a separate implementation?
 
