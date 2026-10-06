@@ -16,8 +16,8 @@ def _wait_seconds(value: str) -> int:
         seconds = int(value)
     except ValueError as exc:
         raise argparse.ArgumentTypeError("wait must be an integer") from exc
-    if not 1 <= seconds <= 30:
-        raise argparse.ArgumentTypeError("wait must be between 1 and 30 seconds")
+    if not 1 <= seconds <= 120:
+        raise argparse.ArgumentTypeError("wait must be between 1 and 120 seconds")
     return seconds
 
 
@@ -40,7 +40,7 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--wipe-data", action="store_true", help="authorize Recovery factory reset after verified Full installation")
     parser.add_argument("--backend", type=Path, help="path to the audited spd_dump executable")
     parser.add_argument("--out", type=Path, help="new private directory for results and full readback")
-    parser.add_argument("--wait", type=_wait_seconds, default=30, help="USB discovery timeout, 1–30 seconds")
+    parser.add_argument("--wait", type=_wait_seconds, default=30, help="USB discovery timeout, 1–120 seconds")
     parser.add_argument("--output-json", type=Path, help="also save the report to a new file; existing files are refused")
     return parser
 

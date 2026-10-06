@@ -1366,7 +1366,7 @@ int main(int argc, char **argv) {
 			argc -= 2; argv += 2;
 		} else if (!strcmp(argv[1], "--wait")) {
 			if (argc <= 2) ERR_EXIT("bad option\n");
-			wait = bounded_decimal(argv[2], 0, 30) * REOPEN_FREQ;
+			wait = bounded_decimal(argv[2], 0, 120) * REOPEN_FREQ;
 			argc -= 2; argv += 2;
 		} else if (!strcmp(argv[1], "--verbose")) {
 			if (argc <= 2) ERR_EXIT("bad option\n");

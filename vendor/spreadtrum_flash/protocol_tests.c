@@ -204,7 +204,7 @@ static void bad_name(void) { select_partition(&test_io, "01234567890123456789012
 static void bad_size(void) { select_partition(&test_io, "super", UINT64_C(0x100000000), 0, BSL_CMD_START_DATA); }
 static void bad_suffix(void) { (void)str_to_size("18446744073709551615G"); }
 static void bad_decimal(void) { (void)str_to_size("18446744073709551616"); }
-static void bad_wait(void) { (void)bounded_decimal("31", 0, 30); }
+static void bad_wait(void) { (void)bounded_decimal("121", 0, 120); }
 static void duplicate_devices(void) { mock_devices = 2; (void)open_unique_device(); }
 static void forbidden_command(void) {
 	char *args[] = { "spd_dump", "read_part", "boot_a", "0", "4096", "/tmp/read", "erase_part", "userdata" };

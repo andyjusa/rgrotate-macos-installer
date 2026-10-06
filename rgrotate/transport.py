@@ -36,8 +36,8 @@ def loader_entries(pac):
 
 
 def probe_arguments(pac, out_dir, backend, wait=30):
-    if not isinstance(wait, int) or not 1 <= wait <= 30:
-        raise ProbeError('wait must be between 1 and 30 seconds')
+    if not isinstance(wait, int) or not 1 <= wait <= 120:
+        raise ProbeError('wait must be between 1 and 120 seconds')
     out = Path(out_dir).resolve()
     out.mkdir(parents=True, exist_ok=False, mode=0o700)
     args = [str(Path(backend).resolve()), '--read-only', '--wait', str(wait),
@@ -98,7 +98,7 @@ def probe(pac, out_dir, backend, wait=30):
              'ram_loader_execution': True, 'product': pac.product}
     args = probe_arguments(pac, out, backend, wait)
     try:
-        run_bounded(args, out)
+        run_bounded(args, out, total_timeout=max(150, wait + 90), idle_timeout=max(45, wait + 5))
         table = out / 'partitions.xml'
         if not table.is_file() or table.stat().st_size > 1024 * 1024:
             raise ProbeError('Missing or unreasonable partition table')

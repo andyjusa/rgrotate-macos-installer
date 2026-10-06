@@ -121,8 +121,8 @@ class InstallSession:
 
 
 def prepare_install(pac, out_dir, backend, wait=30):
-    if not isinstance(wait, int) or not 1 <= wait <= 30:
-        raise InstallError('wait must be between 1 and 30 seconds')
+    if not isinstance(wait, int) or not 1 <= wait <= 120:
+        raise InstallError('wait must be between 1 and 120 seconds')
     backend = Path(backend).resolve(strict=True)
     if not backend.is_file() or not os.access(backend, os.X_OK):
         raise InstallError('Backend must be an executable regular file')
@@ -250,7 +250,7 @@ def install(pac, out_dir, backend, wait=30):
     old_umask = os.umask(0o077)
     try:
         args, session = prepare_install(pac, out_dir, backend, wait)
-        print('Ready: waiting up to 30 seconds for powered-off RG Rotate with Back held and USB connected.', flush=True)
+        print(f'Ready: waiting up to {wait} seconds for powered-off RG Rotate with Back held and USB connected.', flush=True)
         return run_session(args, session)
     finally:
         os.umask(old_umask)

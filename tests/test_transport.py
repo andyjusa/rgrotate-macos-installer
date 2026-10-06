@@ -47,7 +47,7 @@ class TransportTests(unittest.TestCase):
                 probe_arguments(FakePac(), tmp, '/fake/spd_dump')
 
     def test_completed_read_does_not_claim_identity_match(self):
-        def backend(args, out):
+        def backend(args, out, **kwargs):
             (out / 'partitions.xml').write_text('<Partitions><Partition id="boot_a"/><Partition id="super"/><Partition id="userdata"/></Partitions>')
             (out / 'boot_a-first-1MiB.bin').write_bytes(b'A' * 1048576)
         with tempfile.TemporaryDirectory() as tmp, patch('rgrotate.transport.run_bounded', backend):
@@ -57,7 +57,7 @@ class TransportTests(unittest.TestCase):
             self.assertFalse(result['writes_to_device_storage'])
 
     def test_incomplete_sample_is_failure(self):
-        def backend(args, out):
+        def backend(args, out, **kwargs):
             (out / 'partitions.xml').write_text('<Partitions><Partition id="boot_a"/><Partition id="super"/><Partition id="userdata"/></Partitions>')
             (out / 'boot_a-first-1MiB.bin').write_bytes(b'short')
         with tempfile.TemporaryDirectory() as tmp, patch('rgrotate.transport.run_bounded', backend):
