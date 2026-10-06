@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rgrotate-macos-installer"
+version = "0.1.0"
+description = "Experimental macOS PAC inspection and Unisoc installation tooling for RG Rotate"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+
+[project.scripts]
+rgrotate-macos = "rgrotate.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["rgrotate*"]

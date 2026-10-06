@@ -1,0 +1,1680 @@
+/*
+// Spreadtrum SC6531E/SC6531DA firmware dumper for Linux.
+//
+// sudo modprobe ftdi_sio
+// echo 1782 4d00 | sudo tee /sys/bus/usb-serial/drivers/generic/new_id
+// make && sudo ./spd_dump [options] commands...
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+// OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+// THE SOFTWARE.
+*/
+
+#define _GNU_SOURCE 1
+#define _FILE_OFFSET_BITS 64
+
+#include <stdlib.h>
+#include <stdio.h>
+#include <stdint.h>
+#include <string.h>
+#include <ctype.h> // tolower
+#include <errno.h>
+#include <limits.h>
+#include <time.h>
+
+#ifndef LIBUSB_DETACH
+/* detach the device from crappy kernel drivers */
+#define LIBUSB_DETACH 1
+#endif
+
+#if USE_LIBUSB
+#include <libusb.h>
+#else
+#include <termios.h>
+#include <fcntl.h>
+#include <poll.h>
+#endif
+#include <unistd.h>
+
+#include "spd_cmd.h"
+
+static void print_mem(FILE *f, uint8_t *buf, size_t len) {
+	size_t i; int a, j, n;
+	for (i = 0; i < len; i += 16) {
+		n = len - i;
+		if (n > 16) n = 16;
+		for (j = 0; j < n; j++) fprintf(f, "%02x ", buf[i + j]);
+		for (; j < 16; j++) fprintf(f, "   ");
+		fprintf(f, " |");
+		for (j = 0; j < n; j++) {
+			a = buf[i + j];
+			fprintf(f, "%c", a > 0x20 && a < 0x7f ? a : '.');
+		}
+		fprintf(f, "|\n");
+	}
+}
+
+static void print_string(FILE *f, const void *src, size_t n) {
+	size_t i; int a, b = 0;
+	const uint8_t *buf = (const uint8_t*)src;
+	fprintf(f, "\"");
+	for (i = 0; i < n; i++) {
+		a = buf[i]; b = 0;
+		switch (a) {
+		case '"': case '\\': b = a; break;
+		case 0: b = '0'; break;
+		case '\b': b = 'b'; break;
+		case '\t': b = 't'; break;
+		case '\n': b = 'n'; break;
+		case '\f': b = 'f'; break;
+		case '\r': b = 'r'; break;
+		}
+		if (b) fprintf(f, "\\%c", b);
+		else if (a >= 32 && a < 127) fprintf(f, "%c", a);
+		else fprintf(f, "\\x%02x", a);
+	}
+	fprintf(f, "\"\n");
+}
+
+#define ERR_EXIT(...) \
+	do { fprintf(stderr, __VA_ARGS__); exit(1); } while (0)
+
+#define DBG_LOG(...) fprintf(stderr, __VA_ARGS__)
+
+#define RECV_BUF_LEN 1024
+
+typedef struct {
+	uint8_t *raw_buf, *enc_buf, *recv_buf, *temp_buf;
+#if USE_LIBUSB
+	libusb_device_handle *dev_handle;
+	int endp_in, endp_out;
+	int endp_in_blk, endp_out_blk;
+	int interface_number;
+#else
+	int serial;
+#endif
+	int flags, recv_len, recv_pos;
+	int raw_len, enc_len, verbose, timeout;
+	uint64_t recv_deadline;
+} spdio_t;
+
+#define FLAGS_CRC16 1
+#define FLAGS_TRANSCODE 2
+
+static uint64_t monotonic_ms(void) {
+	struct timespec now;
+	if (clock_gettime(CLOCK_MONOTONIC, &now)) ERR_EXIT("clock_gettime failed\n");
+	return (uint64_t)now.tv_sec * 1000 + (unsigned long)now.tv_nsec / 1000000;
+}
+
+#if USE_LIBUSB
+/* Count all matching devices before opening or changing any interface. */
+static libusb_device_handle *open_unique_device(void) {
+	libusb_device **list, *selected = NULL;
+	libusb_device_handle *handle = NULL;
+	ssize_t count = libusb_get_device_list(NULL, &list), j;
+	unsigned matches = 0;
+	int err;
+	if (count < 0) ERR_EXIT("USB enumeration failed: %s\n", libusb_error_name((int)count));
+	for (j = 0; j < count; j++) {
+		struct libusb_device_descriptor desc;
+		err = libusb_get_device_descriptor(list[j], &desc);
+		if (err < 0) ERR_EXIT("USB descriptor failed: %s\n", libusb_error_name(err));
+		if (desc.idVendor == 0x1782 && desc.idProduct == 0x4d00) {
+			selected = list[j]; matches++;
+		}
+	}
+	if (matches > 1) {
+		libusb_free_device_list(list, 1);
+		ERR_EXIT("multiple 1782:4d00 devices; connect only the intended device\n");
+	}
+	if (selected) {
+		err = libusb_open(selected, &handle);
+		if (err < 0) ERR_EXIT("USB open failed: %s\n", libusb_error_name(err));
+	}
+	libusb_free_device_list(list, 1);
+	return handle;
+}
+
+static void find_endpoints(libusb_device_handle *dev_handle, int result[5]) {
+	struct libusb_config_descriptor *config = NULL;
+	libusb_device *device = libusb_get_device(dev_handle);
+	int active, err, k, alt, i, matches = 0, selected_alt = 0;
+	if (!device) ERR_EXIT("libusb_get_device failed\n");
+	err = libusb_get_configuration(dev_handle, &active);
+	if (err < 0) ERR_EXIT("USB get configuration failed: %s\n", libusb_error_name(err));
+	err = active ? libusb_get_active_config_descriptor(device, &config) :
+		libusb_get_config_descriptor(device, 0, &config);
+	if (err < 0) ERR_EXIT("USB config descriptor failed: %s\n", libusb_error_name(err));
+	/* Select one complete bulk pair, not endpoints from different interfaces. */
+	for (k = 0; k < config->bNumInterfaces; k++) {
+		const struct libusb_interface *iface = config->interface + k;
+		for (alt = 0; alt < iface->num_altsetting; alt++) {
+			const struct libusb_interface_descriptor *desc = iface->altsetting + alt;
+			int in = -1, out = -1, in_blk = 0, out_blk = 0;
+			for (i = 0; i < desc->bNumEndpoints; i++) {
+				const struct libusb_endpoint_descriptor *ep = desc->endpoint + i;
+				if ((ep->bmAttributes & LIBUSB_TRANSFER_TYPE_MASK) != LIBUSB_TRANSFER_TYPE_BULK) continue;
+				if (ep->bEndpointAddress & LIBUSB_ENDPOINT_IN) {
+					if (in >= 0) ERR_EXIT("ambiguous bulk IN endpoints\n");
+					in = ep->bEndpointAddress; in_blk = ep->wMaxPacketSize;
+				} else {
+					if (out >= 0) ERR_EXIT("ambiguous bulk OUT endpoints\n");
+					out = ep->bEndpointAddress; out_blk = ep->wMaxPacketSize;
+				}
+			}
+			if (in >= 0 && out >= 0) {
+				matches++;
+				result[0] = in; result[1] = out;
+				result[2] = in_blk; result[3] = out_blk;
+				result[4] = desc->bInterfaceNumber;
+				selected_alt = desc->bAlternateSetting;
+			}
+		}
+	}
+	if (matches != 1) ERR_EXIT("expected one bulk interface/alternate, found %d\n", matches);
+	/* Never reset the current configuration to work around an OS driver. */
+	if (active != config->bConfigurationValue) {
+		err = libusb_set_configuration(dev_handle, config->bConfigurationValue);
+		if (err < 0) ERR_EXIT("USB set configuration failed: %s\n", libusb_error_name(err));
+	}
+	libusb_free_config_descriptor(config);
+#if LIBUSB_DETACH
+	err = libusb_set_auto_detach_kernel_driver(dev_handle, 1);
+	if (err < 0 && err != LIBUSB_ERROR_NOT_SUPPORTED)
+		ERR_EXIT("USB auto detach failed: %s\n", libusb_error_name(err));
+#endif
+	err = libusb_claim_interface(dev_handle, result[4]);
+	if (err < 0) ERR_EXIT("USB claim failed: %s (close other USB applications; no reset/bypass attempted)\n", libusb_error_name(err));
+	if (selected_alt) {
+		err = libusb_set_interface_alt_setting(dev_handle, result[4], selected_alt);
+		if (err < 0) ERR_EXIT("USB alternate setting failed: %s\n", libusb_error_name(err));
+	}
+}
+
+#else
+static void init_serial(int serial) {
+	struct termios tty = { 0 };
+
+	// B921600
+	cfsetispeed(&tty, B115200);
+	cfsetospeed(&tty, B115200);
+
+	tty.c_cflag = CS8 | CLOCAL | CREAD;
+	tty.c_iflag = IGNPAR;
+	tty.c_oflag = 0;
+	tty.c_lflag = 0;
+
+	tty.c_cc[VMIN] = 1;
+	tty.c_cc[VTIME] = 0;
+
+	tcflush(serial, TCIFLUSH);
+	tcsetattr(serial, TCSANOW, &tty);
+}
+#endif
+
+#if USE_LIBUSB
+static spdio_t* spdio_init(libusb_device_handle *dev_handle, int flags) {
+#else
+static spdio_t* spdio_init(int serial, int flags) {
+#endif
+	uint8_t *p; spdio_t *io;
+
+#if USE_LIBUSB
+	int endpoints[5];
+	find_endpoints(dev_handle, endpoints);
+#else
+	init_serial(serial);
+	// fcntl(serial, F_SETFL, FNDELAY);
+	tcflush(serial, TCIOFLUSH);
+#endif
+
+	p = (uint8_t*)malloc(sizeof(spdio_t) + RECV_BUF_LEN + (4 + 0x10000 + 2) * 3 + 2);
+	if (!p) ERR_EXIT("malloc failed\n");
+	io = (spdio_t*)p; p += sizeof(spdio_t);
+	memset(io, 0, sizeof(*io));
+	io->flags = flags;
+#if USE_LIBUSB
+	io->dev_handle = dev_handle;
+	io->endp_in = endpoints[0];
+	io->endp_out = endpoints[1];
+	io->endp_in_blk = endpoints[2];
+	io->endp_out_blk = endpoints[3];
+	io->interface_number = endpoints[4];
+#else
+	io->serial = serial;
+#endif
+	io->recv_len = 0;
+	io->recv_pos = 0;
+	io->recv_buf = p; p += RECV_BUF_LEN;
+	io->temp_buf = p + 4;
+	io->raw_buf = p; p += 4 + 0x10000 + 2;
+	io->enc_buf = p;
+	io->verbose = 0;
+	io->timeout = 1000;
+	return io;
+}
+
+static void spdio_free(spdio_t* io) {
+	if (!io) return;
+#if USE_LIBUSB
+	libusb_release_interface(io->dev_handle, io->interface_number);
+	libusb_close(io->dev_handle);
+#else
+	close(io->serial);
+#endif
+	free(io);
+}
+
+static int spd_transcode(uint8_t *dst, uint8_t *src, int len) {
+	int i, a, n = 0;
+	for (i = 0; i < len; i++) {
+		a = src[i];
+		if (a == HDLC_HEADER || a == HDLC_ESCAPE) {
+			if (dst) dst[n] = HDLC_ESCAPE;
+			n++;
+			a ^= 0x20;
+		}
+		if (dst) dst[n] = a;
+		n++;
+	}
+	return n;
+}
+
+__attribute__((unused))
+static int spd_transcode_max(uint8_t *src, int len, int n) {
+	int i, a;
+	for (i = 0; i < len; i++) {
+		a = src[i];
+		a = a == HDLC_HEADER || a == HDLC_ESCAPE ? 2 : 1;
+		if (n < a) break;
+		n -= a;
+	}
+	return i;
+}
+
+static unsigned spd_crc16(unsigned crc, const void *src, unsigned len) {
+	uint8_t *s = (uint8_t*)src; int i;
+	crc &= 0xffff;
+	while (len--) {
+		crc ^= *s++ << 8;
+		for (i = 0; i < 8; i++)
+			crc = crc << 1 ^ ((0 - (crc >> 15)) & 0x11021);
+	}
+	return crc;
+}
+
+#define CHK_FIXZERO 1
+#define CHK_ORIG 2
+
+static unsigned spd_checksum(unsigned crc, const void *src, int len, int final) {
+	uint8_t *s = (uint8_t*)src;
+
+	while (len > 1) {
+		crc += s[1] << 8 | s[0]; s += 2;
+		len -= 2;
+	}
+	if (len) crc += *s;
+	if (final) {
+		crc = (crc >> 16) + (crc & 0xffff);
+		crc += crc >> 16;
+		crc = ~crc & 0xffff;
+		if (len < final)
+			crc = crc >> 8 | (crc & 0xff) << 8;
+	}
+	return crc;
+}
+
+#define WRITE16_LE(p, a) do { \
+	((uint8_t*)(p))[0] = (uint8_t)(a); \
+	((uint8_t*)(p))[1] = (a) >> 8; \
+} while (0)
+
+#define WRITE32_LE(p, a) do { \
+	((uint8_t*)(p))[0] = (uint8_t)(a); \
+	((uint8_t*)(p))[1] = (a) >> 8; \
+	((uint8_t*)(p))[2] = (a) >> 16; \
+	((uint8_t*)(p))[3] = (a) >> 24; \
+} while (0)
+
+#define READ16_LE(p) ( \
+	((uint8_t*)(p))[0] | \
+	((uint8_t*)(p))[1] << 8)
+
+#define READ32_LE(p) ( \
+	((uint8_t*)(p))[0] | \
+	((uint8_t*)(p))[1] << 8 | \
+	((uint8_t*)(p))[2] << 16 | \
+	((uint32_t)((uint8_t*)(p))[3]) << 24)
+
+#define WRITE16_BE(p, a) do { \
+	((uint8_t*)(p))[0] = (a) >> 8; \
+	((uint8_t*)(p))[1] = (uint8_t)(a); \
+} while (0)
+
+#define WRITE32_BE(p, a) do { \
+	((uint8_t*)(p))[0] = (a) >> 24; \
+	((uint8_t*)(p))[1] = (a) >> 16; \
+	((uint8_t*)(p))[2] = (a) >> 8; \
+	((uint8_t*)(p))[3] = (uint8_t)(a); \
+} while (0)
+
+#define READ16_BE(p) ( \
+	((uint8_t*)(p))[0] << 8 | \
+	((uint8_t*)(p))[1])
+
+#define READ32_BE(p) ( \
+	((uint32_t)((uint8_t*)(p))[0]) << 24 | \
+	((uint8_t*)(p))[1] << 16 | \
+	((uint8_t*)(p))[2] << 8 | \
+	((uint8_t*)(p))[3])
+
+static void encode_msg(spdio_t *io, int type, const void *data, size_t len) {
+	uint8_t *p, *p0; unsigned chk;
+
+	if (len > 0xffff)
+		ERR_EXIT("message too long\n");
+
+	if (type == BSL_CMD_CHECK_BAUD) {
+		memset(io->enc_buf, HDLC_HEADER, len);
+		io->enc_len = len;
+		return;
+	}
+
+	p = p0 = io->raw_buf;
+	WRITE16_BE(p, type); p += 2;
+	WRITE16_BE(p, len); p += 2;
+	if (len) memmove(p, data, len);
+	p += len;
+
+	len = p - p0;
+	if (io->flags & FLAGS_CRC16)
+		chk = spd_crc16(0, p0, len);
+	else {
+		// if (len & 1) *p++ = 0;
+		chk = spd_checksum(0, p0, len, CHK_FIXZERO);
+	}
+	WRITE16_BE(p, chk); p += 2;
+
+	io->raw_len = len = p - p0;
+
+	p = io->enc_buf;
+	*p++ = HDLC_HEADER;
+	if (io->flags & FLAGS_TRANSCODE)
+		len = spd_transcode(p, p0, len);
+	else memcpy(p, p0, len);
+	p[len] = HDLC_HEADER;
+	io->enc_len = len + 2;
+}
+
+static int send_msg(spdio_t *io) {
+	int ret = 0;
+	if (io->timeout < 1 || io->timeout > 120000) ERR_EXIT("invalid USB timeout\n");
+	if (!io->enc_len)
+		ERR_EXIT("empty message\n");
+
+	if (io->verbose >= 2) {
+		DBG_LOG("send (%d):\n", io->enc_len);
+		print_mem(stderr, io->enc_buf, io->enc_len);
+	} else if (io->verbose >= 1) {
+		if (io->raw_buf[0] == HDLC_HEADER)
+			DBG_LOG("send: check baud\n");
+		else if (io->raw_len >= 4) {
+			DBG_LOG("send: type = 0x%02x, size = %d\n",
+					READ16_BE(io->raw_buf), READ16_BE(io->raw_buf + 2));
+		} else DBG_LOG("send: unknown message\n");
+	}
+
+#if USE_LIBUSB
+	{
+		int err = libusb_bulk_transfer(io->dev_handle,
+				io->endp_out, io->enc_buf, io->enc_len, &ret, io->timeout);
+		if (err < 0)
+			ERR_EXIT("usb_send failed : %s\n", libusb_error_name(err));
+	}
+	if (ret != io->enc_len)
+		ERR_EXIT("short USB write (%d / %d); no retry attempted\n", ret, io->enc_len);
+	// UMS9117 waits too long after a 512 byte block.
+	if (io->endp_out_blk == 512 && !((unsigned)io->enc_len % 512)) {
+		int dummy;
+		// signal end of transfer
+		int err = libusb_bulk_transfer(io->dev_handle,
+				io->endp_out, NULL, 0, &dummy, io->timeout);
+		if (err < 0) ERR_EXIT("USB end-of-transfer failed: %s\n", libusb_error_name(err));
+	}
+#else
+	ret = write(io->serial, io->enc_buf, io->enc_len);
+#endif
+	if (ret != io->enc_len)
+		ERR_EXIT("usb_send failed (%d / %d)\n", ret, io->enc_len);
+
+#if !USE_LIBUSB
+	tcdrain(io->serial);
+	// usleep(1000);
+#endif
+	return ret;
+}
+
+static int recv_msg1(spdio_t *io) {
+	int a, pos, len, chk;
+	int esc = 0, nread = 0, head_found = 0, complete = 0, plen = 6;
+
+	len = io->recv_len;
+	pos = io->recv_pos;
+	for (;;) {
+		uint64_t now = monotonic_ms();
+		int remaining;
+		if (now >= io->recv_deadline) break;
+		remaining = (int)(io->recv_deadline - now);
+		if (pos >= len) {
+#if USE_LIBUSB
+			int err;
+			len = 0;
+			err = libusb_bulk_transfer(io->dev_handle, io->endp_in, io->recv_buf, RECV_BUF_LEN, &len, remaining);
+			if (err == LIBUSB_ERROR_NO_DEVICE)
+				ERR_EXIT("connection closed\n");
+			else if (err == LIBUSB_ERROR_TIMEOUT) {
+				/* An incomplete transfer is not a complete protocol response. */
+				if (len || nread) ERR_EXIT("timeout during response; session must not be reused\n");
+				break;
+			}
+			else if (err < 0)
+				ERR_EXIT("usb_recv failed : %s\n", libusb_error_name(err));
+#else
+			if (io->timeout >= 0) {
+				struct pollfd fds = { 0 };
+				fds.fd = io->serial;
+				fds.events = POLLIN;
+				a = poll(&fds, 1, remaining);
+				if (a < 0) ERR_EXIT("poll failed, ret = %d\n", a);
+				if (fds.revents & POLLHUP)
+					ERR_EXIT("connection closed\n");
+				if (!a) break;
+			}
+			len = read(io->serial, io->recv_buf, RECV_BUF_LEN);
+#endif
+			if (len < 0)
+				ERR_EXIT("usb_recv failed, ret = %d\n", len);
+
+			if (io->verbose >= 2) {
+				DBG_LOG("recv (%d):\n", len);
+				print_mem(stderr, io->recv_buf, len);
+			}
+			pos = 0;
+			if (!len) break;
+		}
+		a = io->recv_buf[pos++];
+		if (io->flags & FLAGS_TRANSCODE) {
+			if (esc && a != (HDLC_HEADER ^ 0x20) &&
+					a != (HDLC_ESCAPE ^ 0x20))
+				ERR_EXIT("unexpected escaped byte (0x%02x)\n", a);
+			if (a == HDLC_HEADER) {
+				if (!head_found) head_found = 1;
+				else if (!nread) continue;
+				else if (nread < plen)
+					ERR_EXIT("recieved message too short\n");
+				else { complete = 1; break; }
+			} else if (a == HDLC_ESCAPE) {
+				esc = 0x20;
+			} else {
+				if (!head_found) continue;
+				if (nread >= plen)
+					ERR_EXIT("recieved message too long\n");
+				io->raw_buf[nread++] = a ^ esc;
+				esc = 0;
+			}
+		} else {
+			if (!head_found) {
+				if (a == HDLC_HEADER) head_found = 1;
+				continue;
+			}
+			if (nread == plen) {
+				if (a != HDLC_HEADER)
+					ERR_EXIT("expected end of message\n");
+				complete = 1; break;
+			}
+			io->raw_buf[nread++] = a;
+		}
+		if (nread == 4) {
+			a = READ16_BE(io->raw_buf + 2);	// len
+			plen = a + 6;
+		}
+	}
+	io->recv_len = len;
+	io->recv_pos = pos;
+	io->raw_len = nread;
+	if (!nread) return 0;
+	if (!complete || esc) ERR_EXIT("incomplete response; session must not be reused\n");
+
+	if (nread < 6)
+		ERR_EXIT("recieved message too short\n");
+
+	if (nread != plen)
+		ERR_EXIT("bad length (%d, expected %d)\n", nread, plen);
+
+	if (io->flags & FLAGS_CRC16)
+		chk = spd_crc16(0, io->raw_buf, plen - 2);
+	else
+		chk = spd_checksum(0, io->raw_buf, plen - 2, CHK_ORIG);
+
+	a = READ16_BE(io->raw_buf + plen - 2);
+	if (a != chk)
+		ERR_EXIT("bad checksum (0x%04x, expected 0x%04x)\n", a, chk);
+
+	if (io->verbose == 1)
+		DBG_LOG("recv: type = 0x%02x, size = %d\n",
+				READ16_BE(io->raw_buf), READ16_BE(io->raw_buf + 2));
+
+	return nread;
+}
+
+static unsigned recv_type(spdio_t *io) {
+	if (io->raw_len < 6) return -1;
+	return READ16_BE(io->raw_buf);
+}
+
+static int recv_msg(spdio_t *io) {
+	int ret;
+	if (io->timeout < 1 || io->timeout > 120000) ERR_EXIT("invalid USB timeout\n");
+	io->recv_deadline = monotonic_ms() + (unsigned)io->timeout;
+	for (;;) {
+		ret = recv_msg1(io);
+		if (!ret || recv_type(io) != BSL_REP_LOG) break;
+		DBG_LOG("BSL_REP_LOG: ");
+		print_string(stderr, io->raw_buf + 4, READ16_BE(io->raw_buf + 2));
+	}
+	return ret;
+}
+
+static int recv_msg_timeout(spdio_t *io, int timeout) {
+	int old = io->timeout, ret;
+	io->timeout = timeout;
+	ret = recv_msg(io);
+	io->timeout = old;
+	return ret;
+}
+
+static void send_and_check(spdio_t *io) {
+	int ret;
+	send_msg(io);
+	ret = recv_msg(io);
+	if (!ret) ERR_EXIT("timeout reached\n");
+	ret = recv_type(io);
+	if (ret != BSL_REP_ACK)
+		ERR_EXIT("unexpected response (0x%04x)\n", ret);
+}
+
+static void send_and_check_timeout(spdio_t *io, int timeout) {
+	int old = io->timeout;
+	io->timeout = timeout;
+	send_and_check(io);
+	io->timeout = old;
+}
+
+static void check_confirm(const char *name) {
+	char buf[4], c; int i;
+	printf("Answer \"yes\" to confirm the \"%s\" command: ", name);
+	fflush(stdout);
+	do {
+		i = scanf("%3s%c", buf, &c);
+		if (i != 2 || c != '\n') break;
+		for (i = 0; buf[i]; i++) buf[i] = tolower(buf[i]);
+		if (!strcmp(buf, "yes")) return;
+	} while (0);
+	ERR_EXIT("operation is not confirmed\n");
+}
+
+static uint8_t* loadfile(const char *fn, size_t *num, size_t extra) {
+	size_t n, j = 0; uint8_t *buf = 0;
+	off_t file_len;
+	FILE *fi = fopen(fn, "rb");
+	if (fi) {
+		if (fseeko(fi, 0, SEEK_END) || (file_len = ftello(fi)) < 0)
+			ERR_EXIT("input size/seek failed\n");
+		/* This helper loads only RAM loaders and small XML files, never super. */
+		if ((uint64_t)file_len > 64 * 1024 * 1024 || extra > SIZE_MAX - (uint64_t)file_len)
+			ERR_EXIT("RAM loader/XML exceeds 64 MiB limit\n");
+		n = (size_t)file_len;
+		if (n) {
+			if (fseeko(fi, 0, SEEK_SET)) ERR_EXIT("input seek failed\n");
+			buf = (uint8_t*)malloc(n + extra);
+			if (buf) j = fread(buf, 1, n, fi);
+			if (buf && j != n) ERR_EXIT("incomplete input file read\n");
+		}
+		fclose(fi);
+	}
+	if (num) *num = j;
+	return buf;
+}
+
+static void send_buf(spdio_t *io,
+		uint32_t start_addr, int end_data,
+		unsigned step, uint8_t *mem, unsigned size) {
+	uint32_t data[2], i, n;
+
+	WRITE32_BE(data, start_addr);
+	WRITE32_BE(data + 1, size);
+
+	encode_msg(io, BSL_CMD_START_DATA, data, 4 * 2);
+	send_and_check(io);
+	for (i = 0; i < size; i += n) {
+		n = size - i;
+		// n = spd_transcode_max(mem + i, size - i, 2048 - 2 - 6);
+		if (n > step) n = step;
+		encode_msg(io, BSL_CMD_MIDST_DATA, mem + i, n);
+		send_and_check(io);
+	}
+	if (!end_data) return;
+	encode_msg(io, BSL_CMD_END_DATA, NULL, 0);
+	send_and_check(io);
+}
+
+static void send_file(spdio_t *io, const char *fn,
+		uint32_t start_addr, int end_data, unsigned step,
+		unsigned src_offs, unsigned src_size) {
+	uint8_t *mem; size_t size = 0;
+	mem = loadfile(fn, &size, 0);
+	if (!mem) ERR_EXIT("loadfile(\"%s\") failed\n", fn);
+	if (size >> 32) ERR_EXIT("file too big\n");
+	if (size < src_offs)
+		ERR_EXIT("data outside the file\n");
+	size -= src_offs;
+	if (src_size) {
+		if (size < src_size)
+			ERR_EXIT("data outside the file\n");
+		size = src_size;
+	}
+	send_buf(io, start_addr, end_data, step, mem + src_offs, size);
+	free(mem);
+}
+
+static void erase_flash(spdio_t *io, uint32_t addr, uint32_t size) {
+	uint32_t data[2];
+	check_confirm("erase flash");
+	WRITE32_BE(data, addr);
+	WRITE32_BE(data + 1, size);
+	encode_msg(io, BSL_CMD_ERASE_FLASH, data, 4 * 2);
+	send_and_check(io);
+}
+
+static unsigned read_flash(spdio_t *io,
+		uint32_t addr, uint32_t start, uint32_t len,
+		uint8_t *mem, FILE *fo, unsigned step) {
+	uint32_t n, offset, nread;
+	int ret;
+
+	for (offset = start; offset < start + len; ) {
+		uint32_t data[3];
+		n = start + len - offset;
+		if (n > step) n = step;
+
+		WRITE32_BE(data, addr);
+		WRITE32_BE(data + 1, n);
+		WRITE32_BE(data + 2, offset);
+
+		encode_msg(io, BSL_CMD_READ_FLASH, data, 4 * 3);
+		send_msg(io);
+		ret = recv_msg(io);
+		if ((ret = recv_type(io)) != BSL_REP_READ_FLASH)
+			ERR_EXIT("unexpected read response (0x%04x)\n", ret);
+		nread = READ16_BE(io->raw_buf + 2);
+		if (n != nread)
+			ERR_EXIT("short or oversized read (%u / %u)\n", nread, n);
+		if (mem) {
+			memcpy(mem, io->raw_buf + 4, nread);
+			mem += nread;
+		}
+		if (fo && fwrite(io->raw_buf + 4, 1, nread, fo) != nread) {
+			ERR_EXIT("fwrite(dump) failed\n");
+		}
+		offset += nread;
+
+	}
+	return offset - start;
+}
+
+static unsigned dump_flash(spdio_t *io,
+		uint32_t addr, uint32_t start, uint32_t len,
+		const char *fn, unsigned step, int mode) {
+	uint32_t nread = 0; char dhtb = 0;
+	FILE *fo = fopen(fn, "wb");
+	if (!fo) ERR_EXIT("fopen(dump) failed\n");
+
+	if (mode == 1) {
+		uint8_t buf[0x34];
+		len = sizeof(buf);
+		nread = read_flash(io, addr, start, len, buf, fo, step);
+		if (nread != len)
+			ERR_EXIT("can't read partition header\n");
+		// "DHTB" -> "BTHD", Boot Header
+		if (READ32_LE(buf) == 0x42544844 && READ32_LE(buf + 4) == 1) {
+			len = READ32_LE(buf + 0x30);
+			if (len >> 31) ERR_EXIT("unexpected DHTB size (0x%x)\n", len);
+			len += 0x200; dhtb = 1;
+		// "VNTS" -> "STNV"
+		} else if (READ32_LE(buf) == 0x53544e56) {
+			unsigned nblk = READ16_LE(buf + 12);
+			unsigned blk = READ16_LE(buf + 14);
+			if (nblk < 4) ERR_EXIT("unexpected VNTS header\n");
+			if ((blk & (blk - 1)) || blk < 0x100)
+				ERR_EXIT("unexpected VNTS block size (0x%x)\n", blk);
+			len = blk * nblk;
+		} else ERR_EXIT("unable to determine partition size\n");
+	}
+	nread += read_flash(io, addr, start + nread, len - nread, NULL, fo, step);
+	if (dhtb && len == nread) do {	// read DHTB signature
+		uint8_t buf[0x60];
+		uint32_t nread2, nread1;
+		nread2 = read_flash(io, addr, start + nread, 0x60, buf, NULL, step);
+		// can be unsigned
+		if (nread2 != 0x60) break;
+		if (!READ32_LE(buf + 0x10)) break; // all zeros
+		if (!~READ32_LE(buf + 0x10)) break; // all ones
+
+		if (fwrite(buf, 1, nread2, fo) != nread2)
+			ERR_EXIT("fwrite(dump) failed\n");
+
+		nread1 = nread; len = nread += nread2;
+		if (READ32_LE(buf + 0x10) != nread1 - 0x200 || // data size
+				READ32_LE(buf + 0x18) != 0x200 || // data offset
+				READ32_LE(buf + 0x20) >> 12 || // sign data size (0x254, 0x234)
+				READ32_LE(buf + 0x28) != nread1 + 0x60) { // sign data offset
+			DBG_LOG("unexpected DHTB signature\n");
+			break;
+		}
+		len += nread2 = READ32_LE(buf + 0x20);
+		nread += read_flash(io, addr, start + nread, nread2, NULL, fo, step);
+	} while (0);
+	DBG_LOG("dump_flash: 0x%08x+0x%x, target: 0x%x, read: 0x%x\n", addr, start, len, nread);
+	if (fclose(fo)) ERR_EXIT("output close failed\n");
+	return nread;
+}
+
+static unsigned dump_mem(spdio_t *io,
+		uint32_t start, uint32_t len, const char *fn, unsigned step) {
+	uint32_t n, offset, nread;
+	int ret;
+	FILE *fo = fopen(fn, "wb");
+	if (!fo) ERR_EXIT("fopen(dump) failed\n");
+
+	for (offset = start; offset < start + len; ) {
+		uint32_t data[3];
+		n = start + len - offset;
+		if (n > step) n = step;
+
+		WRITE32_BE(data, offset);
+		WRITE32_BE(data + 1, n);
+		WRITE32_BE(data + 2, 0);	// unused
+
+		encode_msg(io, BSL_CMD_READ_FLASH, data, sizeof(data));
+		send_msg(io);
+		ret = recv_msg(io);
+		if ((ret = recv_type(io)) != BSL_REP_READ_FLASH)
+			ERR_EXIT("unexpected read response (0x%04x)\n", ret);
+		nread = READ16_BE(io->raw_buf + 2);
+		if (n != nread)
+			ERR_EXIT("short or oversized read (%u / %u)\n", nread, n);
+		if (fwrite(io->raw_buf + 4, 1, nread, fo) != nread) 
+			ERR_EXIT("fwrite(dump) failed\n");
+		offset += nread;
+
+	}
+	DBG_LOG("dump_mem: 0x%08x, target: 0x%x, read: 0x%x\n", start, len, offset - start);
+	if (fclose(fo)) ERR_EXIT("output close failed\n");
+	return offset;
+}
+
+static int copy_to_wstr(uint16_t *d, size_t n, const char *s) {
+	size_t i; int a = -1;
+	for (i = 0; a && i < n; i++) { a = s[i]; WRITE16_LE(d + i, a); }
+	return a;
+}
+
+static int copy_from_wstr(char *d, size_t n, const uint16_t *s) {
+	size_t i; int a = -1;
+	for (i = 0; a && i < n; i++) { d[i] = a = READ16_LE(s + i); if (a >> 8) break; }
+	return a;
+}
+
+static void select_partition(spdio_t *io, const char *name,
+		uint64_t size, int mode64, int cmd) {
+	uint32_t t32; uint64_t n64;
+	struct {
+		uint16_t name[36];
+		uint32_t size, size_hi; uint64_t dummy;
+	} pkt = { 0 };
+	int ret;
+
+	if (!name[0]) ERR_EXIT("empty partition name\n");
+	if (!mode64 && size > UINT32_MAX) ERR_EXIT("partition size requires 64-bit encoding\n");
+	ret = copy_to_wstr(pkt.name, sizeof(pkt.name) / 2, name);
+	if (ret) ERR_EXIT("name too long\n");
+	n64 = size;
+	WRITE32_LE(&pkt.size, n64);
+	if (mode64) {
+		t32 = n64 >> 32;
+		WRITE32_LE(&pkt.size_hi, t32);
+	}
+
+	encode_msg(io, cmd, &pkt,
+			sizeof(pkt.name) + (mode64 ? 16 : 4));
+}
+
+static uint64_t dump_partition(spdio_t *io,
+		const char *name, uint64_t start, uint64_t len,
+		const char *fn, unsigned step) {
+	uint32_t n, nread, t32; uint64_t offset, n64;
+	int ret, mode64;
+	FILE *fo;
+
+	if (!len || start > UINT64_MAX - len || !step || step > 0xffff)
+		ERR_EXIT("invalid partition read range/block size\n");
+	mode64 = start + len > UINT32_MAX;
+	select_partition(io, name, start + len, mode64, BSL_CMD_READ_START);
+	send_and_check(io);
+
+	fo = fopen(fn, "wb");
+	if (!fo) ERR_EXIT("fopen(dump) failed\n");
+
+	for (offset = start; (n64 = start + len - offset); ) {
+		uint32_t data[3];
+		n = n64 > step ? step : n64;
+
+		WRITE32_LE(data, n);
+		WRITE32_LE(data + 1, offset);
+		t32 = offset >> 32;
+		WRITE32_LE(data + 2, t32);
+
+		encode_msg(io, BSL_CMD_READ_MIDST, data, mode64 ? 12 : 8);
+		send_msg(io);
+		ret = recv_msg(io);
+		if ((ret = recv_type(io)) != BSL_REP_READ_FLASH)
+			ERR_EXIT("unexpected read response (0x%04x)\n", ret);
+		nread = READ16_BE(io->raw_buf + 2);
+		if (n != nread)
+			ERR_EXIT("short or oversized read (%u / %u)\n", nread, n);
+		if (fwrite(io->raw_buf + 4, 1, nread, fo) != nread) 
+			ERR_EXIT("fwrite(dump) failed\n");
+		offset += nread;
+
+	}
+	DBG_LOG("dump_partition: %s+0x%llx, target: 0x%llx, read: 0x%llx\n",
+			name, (long long)start, (long long)len,
+			(long long)(offset - start));
+	if (fclose(fo)) ERR_EXIT("output close failed\n");
+
+	encode_msg(io, BSL_CMD_READ_END, NULL, 0);
+	send_and_check(io);
+	return offset;
+}
+
+static uint64_t read_pactime(spdio_t *io) {
+	uint32_t n, offset = 0x81400, len = 8;
+	int ret; uint32_t data[2];
+	unsigned long long time, unix;
+
+	select_partition(io, "miscdata", offset + len, 0, BSL_CMD_READ_START);
+	send_and_check(io);
+
+	WRITE32_LE(data, len);
+	WRITE32_LE(data + 1, offset);
+	encode_msg(io, BSL_CMD_READ_MIDST, data, sizeof(data));
+	send_msg(io);
+	recv_msg(io);
+	if ((ret = recv_type(io)) != BSL_REP_READ_FLASH)
+		ERR_EXIT("unexpected response (0x%04x)\n", ret);
+	n = READ16_BE(io->raw_buf + 2);
+	if (n != len) ERR_EXIT("unexpected length\n");
+
+	time = (uint32_t)READ32_LE(io->raw_buf + 4);
+	time |= (uint64_t)READ32_LE(io->raw_buf + 8) << 32;
+
+	unix = time ? time / 10000000 - 11644473600 : 0;
+	// $ date -d @unixtime
+	DBG_LOG("pactime = 0x%llx (unix = %llu)\n", time, unix);
+
+	encode_msg(io, BSL_CMD_READ_END, NULL, 0);
+	send_and_check(io);
+	return time;
+}
+
+static int scan_xml_partitions(const char *fn, uint8_t *buf, size_t buf_size) {
+	const char *part1 = "Partitions>";
+	char *src, *p, name[36]; size_t size = 0;
+	int part1_len = strlen(part1), found = 0, stage = 0;
+	src = (char*)loadfile(fn, &size, 1);
+	if (!src) ERR_EXIT("loadfile failed\n");
+	src[size] = 0;
+	p = src;
+	for (;;) {
+		int i, a = *p++, n; char c; long long size;
+		if (a == ' ' || a == '\t' || a == '\n' || a == '\r') continue;
+		if (a != '<') {
+			if (!a) break;
+			if (stage != 1) continue;
+			ERR_EXIT("xml: unexpected symbol\n");
+		}
+		if (!memcmp(p, "!--", 3)) {
+			p = strstr(p + 3, "--");
+			if (!p || !((p[-1] - '!') | (p[-2] - '<')) || p[2] != '>')
+				ERR_EXIT("xml: unexpected syntax\n");
+			p += 3;
+			continue;
+		}
+		if (stage != 1) {
+			stage += !memcmp(p, part1, part1_len);
+			if (stage > 2)
+				ERR_EXIT("xml: more than one partition lists\n");
+			p = strchr(p, '>');
+			if (!p) ERR_EXIT("xml: unexpected syntax\n");
+			p++;
+			continue;
+		}
+		if (*p == '/' && !memcmp(p + 1, part1, part1_len)) {
+			p = p + 1 + part1_len;
+			stage++;
+			continue;
+		}
+		i = sscanf(p, "Partition id=\"%35[^\"]\" size=\"%lli\"/%n%c", name, &size, &n, &c);
+		if (i != 3 || c != '>')
+			ERR_EXIT("xml: unexpected syntax\n");
+		p += n + 1;
+		if (buf_size < 0x4c)
+			ERR_EXIT("xml: too many partitions\n");
+		buf_size -= 0x4c;
+		memset(buf, 0, 36 * 2);
+		for (i = 0; (a = name[i]); i++) buf[i * 2] = a;
+		if (!i) ERR_EXIT("empty partition name\n");
+		WRITE32_LE(buf + 0x48, size);
+		buf += 0x4c;
+		DBG_LOG("[%d] %s, %d\n", found, name, (int)size);
+		found++;
+	}
+	if (p - 1 != src + size) ERR_EXIT("xml: zero byte");
+	if (stage != 2) ERR_EXIT("xml: unexpected syntax\n");
+	free(src);
+	return found;
+}
+
+static void partition_list(spdio_t *io, const char *fn, unsigned sh) {
+	unsigned size, i, n; char name[37];
+	int ret; FILE *fo = NULL; uint8_t *p;
+	uint32_t mask = 0;
+
+	encode_msg(io, BSL_CMD_READ_PARTITION, NULL, 0);
+	send_msg(io);
+	recv_msg(io);
+	ret = recv_type(io);
+	if (ret != BSL_REP_READ_PARTITION)
+		ERR_EXIT("unexpected response (0x%04x)\n", ret);
+	size = READ16_BE(io->raw_buf + 2);
+	if (!size || size % 0x4c)
+		ERR_EXIT("not divisible by struct size (0x%04x)\n", size);
+	n = size / 0x4c;
+	if (strcmp(fn, "-")) {
+		fo = fopen(fn, "wb");
+		if (!fo) ERR_EXIT("fopen failed\n");
+		fprintf(fo, "<Partitions>\n");
+	}
+	p = io->raw_buf + 4;
+	for (i = 0; i < n; i++, p += 0x4c) {
+		ret = copy_from_wstr(name, 36, (uint16_t*)p);
+		if (ret) ERR_EXIT("bad partition name\n");
+		size = READ32_LE(p + 0x48);
+		mask |= size;
+		DBG_LOG("[%d] %s, %u (%u)\n", i, name, size >> sh, size);
+		if (fo) {
+			fprintf(fo, "    <Partition id=\"%s\" size=\"", name);
+			if (i + 1 == n) fprintf(fo, "0x%x\"/>\n", ~0);
+			else fprintf(fo, "%u\"/>\n", size >> sh);
+		}
+	}
+	if (mask & ((1 << sh) - 1)) {
+		DBG_LOG("The unit size is wrong!\n");
+		if (!(mask & 0x7f))
+			DBG_LOG("The partition table probably uses 4KB sectors, use partition_list_4k command.\n");
+		if (fo) fprintf(fo, "<error>Wrong unit size, do not use this table!</error>\n");
+	}
+	if (fo) {
+		fprintf(fo, "</Partitions>\n");
+		if (fclose(fo)) ERR_EXIT("output close failed\n");
+	}
+	if (mask & ((1u << sh) - 1)) ERR_EXIT("partition table unit mismatch\n");
+}
+
+static void repartition(spdio_t *io, const char *fn) {
+	uint8_t *buf = io->temp_buf;
+	int n = scan_xml_partitions(fn, buf, 0xffff);
+	// print_mem(stderr, io->temp_buf, n * 0x4c);
+	check_confirm("repartition");
+	encode_msg(io, BSL_CMD_REPARTITION, buf, n * 0x4c);
+	send_and_check(io);
+}
+
+static void erase_partition(spdio_t *io, const char *name) {
+	check_confirm("erase partition");
+	select_partition(io, name, 0, 0, BSL_CMD_ERASE_FLASH);
+	send_and_check_timeout(io, 120000);
+}
+
+static void load_partition(spdio_t *io, const char *name,
+		const char *fn, unsigned step) {
+	uint64_t offset, len, n64;
+	unsigned mode64, n; int ret;
+	off_t file_len;
+	FILE *fi;
+
+	fi = fopen(fn, "rb");
+	if (!fi) ERR_EXIT("fopen(load) failed\n");
+
+	if (fseeko(fi, 0, SEEK_END) || (file_len = ftello(fi)) <= 0 ||
+		fseeko(fi, 0, SEEK_SET)) ERR_EXIT("invalid input file/seek failure\n");
+	len = (uint64_t)file_len;
+	if (!step || step > 0xffff) ERR_EXIT("invalid block size\n");
+	DBG_LOG("file size : 0x%llx\n", (long long)len);
+
+	mode64 = len > UINT32_MAX;
+	check_confirm("write partition");
+	select_partition(io, name, len, mode64, BSL_CMD_START_DATA);
+	send_and_check_timeout(io, 15000);
+
+	for (offset = 0; (n64 = len - offset); offset += n) {
+		n = n64 > step ? step : n64;
+		if (fread(io->temp_buf, 1, n, fi) != n) 
+			ERR_EXIT("fread(load) failed\n");
+		encode_msg(io, BSL_CMD_MIDST_DATA, io->temp_buf, n);
+		send_msg(io);
+		ret = recv_msg_timeout(io, 15000);
+		if (!ret) ERR_EXIT("timeout reached\n");
+		if ((ret = recv_type(io)) != BSL_REP_ACK)
+			ERR_EXIT("unexpected response (0x%04x); write aborted\n", ret);
+	}
+	DBG_LOG("load_partition: %s, target: 0x%llx, written: 0x%llx\n",
+			name, (long long)len, (long long)offset);
+	fclose(fi);
+	encode_msg(io, BSL_CMD_END_DATA, NULL, 0);
+	send_and_check_timeout(io, 120000);
+}
+
+static int64_t find_partition_size(spdio_t *io, const char *name) {
+	uint32_t t32; uint64_t n64; long long offset = 0;
+	int ret, i, start = 47;
+
+	select_partition(io, name, 1ll << (start + 1), 1, BSL_CMD_READ_START);
+	send_and_check(io);
+
+	for (i = start; i >= 20; i--) {
+		uint32_t data[3];
+		n64 = offset + (1ll << i) - (1 << 20);
+		WRITE32_LE(data, 4);
+		WRITE32_LE(data + 1, n64);
+		t32 = n64 >> 32;
+		WRITE32_LE(data + 2, t32);
+
+		encode_msg(io, BSL_CMD_READ_MIDST, data, sizeof(data));
+		send_msg(io);
+		recv_msg(io);
+		ret = recv_type(io);
+		if (ret != BSL_REP_READ_FLASH) continue;
+		offset = n64 + (1 << 20);
+	}
+	DBG_LOG("partition_size: %s, 0x%llx\n", name, offset);
+	encode_msg(io, BSL_CMD_READ_END, NULL, 0);
+	send_and_check(io);
+	return offset;
+}
+
+static uint32_t t117_exec_dist = 0;
+
+static void t117_exec_workaround(spdio_t *io, uint32_t addr) {
+	uint8_t *buf = io->temp_buf, *p;
+	unsigned dist = t117_exec_dist;
+	unsigned i, n = 252, skip = 3;
+
+	addr += 0x200;
+#define X(v) ((unsigned)((v) & 0xff) - 0x7d < 2)
+	if (addr >= 0x40000 || X(addr) || X(addr >> 8))
+		ERR_EXIT("unsupported exec address\n");
+	if (dist >> 16) ERR_EXIT("unsupported dist\n");
+	if (X(dist)) skip--;
+	if (X(dist >> 8)) skip--;
+#undef X
+
+	p = buf;
+	for (i = 0; i < skip; i++) *p++ = 0;
+	for (i = 0; i < n; i++, p += 4) WRITE32_LE(p, addr);
+	if (skip & 1) *p++ = 0; // align
+	encode_msg(io, dist, buf, p - buf);
+	send_msg(io); // no ack
+}
+
+static void dump_efuse(spdio_t *io, uint32_t id, const char *fn) {
+	unsigned n, n2; int ret;
+
+	if (!id) ERR_EXIT("dump_efuse: custom FDL required\n");
+	// SC6530, SC6530C, SC6531
+	if ((id ^ 0x65300000) >> 17 == 0) n = 8;
+	// SC6531E
+	else if ((id ^ 0x65620000) >> 16 == 0) n = 16;
+	// UMS9117
+	else if ((id ^ 0x98180000) >> 16 == 0) n = 64;
+	else ERR_EXIT("dump_efuse: unknown chip\n");
+
+	encode_msg(io, 0x6566, NULL, 0);
+	send_msg(io);
+	ret = recv_msg(io);
+	if ((ret = recv_type(io)) != BSL_REP_READ_FLASH)
+		ERR_EXIT("unexpected response (0x%04x)\n", ret);
+
+	n2 = READ16_BE(io->raw_buf + 2);
+	if (n2 != n * 4)
+		ERR_EXIT("unexpected size (0x%04x)\n", n2);
+
+	if (!strcmp(fn, "-")) {
+		uint32_t *p = (uint32_t*)(io->raw_buf + 4);
+		unsigned i;
+		if (n != 64) printf("efuse data:\n");
+		else {
+			printf("efuse data (double):\n");
+			for (i = 0; i < n / 2; printf("\n")) {
+				printf("0x%02x:", i);
+				do printf(" %08x", READ32_LE(p + i * 2) | READ32_LE(p + i * 2 + 1));
+				while (++i & 3);
+			}
+			printf("efuse data (raw):\n");
+		}
+		for (i = 0; i < n; printf("\n")) {
+			printf("0x%02x:", i);
+			do printf(" %08x", READ32_LE(p + i));
+			while (++i & 3);
+		}
+	} else {
+		FILE *fo = fopen(fn, "wb");
+		if (!fo) ERR_EXIT("fopen(dump) failed\n");
+		if (fwrite(io->raw_buf + 4, 1, n * 4, fo) != n * 4)
+			ERR_EXIT("fwrite(dump) failed\n");
+		if (fclose(fo)) ERR_EXIT("output close failed\n");
+	}
+}
+
+static uint64_t str_to_size(const char *str) {
+	char *end; int shl = 0; uint64_t n;
+	if ((unsigned)(*str - '0') >= 10)
+		ERR_EXIT("bad command args\n");
+	errno = 0;
+	n = strtoull(str, &end, 0);
+	if (errno == ERANGE || end == str) ERR_EXIT("size overflow/invalid size\n");
+	if (*end) {
+		if (!strcmp(end, "K")) shl = 10;
+		else if (!strcmp(end, "M")) shl = 20;
+		else if (!strcmp(end, "G")) shl = 30;
+		else ERR_EXIT("unknown size suffix\n");
+	}
+	if (n > (UINT64_MAX >> shl)) ERR_EXIT("size overflow on multiply\n");
+	return n << shl;
+}
+
+static uint64_t str_to_addr(const char *str, const char *name, uint32_t base) {
+	uint32_t sh = 32; uint64_t ret;
+	int a, i = 0;
+	do if (!(a = name[i])) {
+		str += i;
+		if (base == ~0u)
+			ERR_EXIT("%s address is unknown\n", name);
+		if (!(a = *str++)) return base;
+		if (a != '+') ERR_EXIT("bad command args\n");
+		sh = 26; /* 64MB */
+		goto found;
+	} while (a == str[i++]);
+	base = 0;
+found:
+	ret = str_to_size(str);
+	if (ret >> sh)
+		ERR_EXIT("address limit reached\n");
+	return ret + base;
+}
+
+#define REOPEN_FREQ 2
+
+static int bounded_decimal(const char *text, int minimum, int maximum) {
+	char *end; long value;
+	if (!text[0] || text[0] < '0' || text[0] > '9') ERR_EXIT("invalid numeric option\n");
+	errno = 0;
+	value = strtol(text, &end, 10);
+	if (*end || errno == ERANGE || value < minimum || value > maximum)
+		ERR_EXIT("numeric option must be between %d and %d\n", minimum, maximum);
+	return (int)value;
+}
+
+/* Check the entire sequence before opening USB, including commands after reads.
+ * FDL code executes in RAM; the orchestrator must authenticate the exact official
+ * loader files/addresses. This flag cannot prove that arbitrary loader code is safe.
+ */
+static void validate_readonly_commands(int argc, char **argv) {
+	int pos = 1, loaders = 0;
+	while (pos < argc) {
+		const char *command = argv[pos];
+		int args;
+		if (!strcmp(command, "fdl")) args = 2;
+		else if (!strcmp(command, "read_part")) args = 4;
+		else if (!strcmp(command, "partition_list") || !strcmp(command, "partition_list_4k") ||
+			!strcmp(command, "blk_size") || !strcmp(command, "timeout") || !strcmp(command, "verbose")) args = 1;
+		else if (!strcmp(command, "disable_transcode") || !strcmp(command, "power_off")) args = 0;
+		else ERR_EXIT("--read-only forbids command: %s\n", command);
+		if (argc - pos <= args) ERR_EXIT("missing arguments for %s\n", command);
+		if (!strcmp(command, "fdl")) {
+			if (++loaders > 2 || str_to_size(argv[pos + 2]) > UINT32_MAX)
+				ERR_EXIT("read-only probe requires at most two 32-bit-address FDL loaders\n");
+		} else if (!strcmp(command, "read_part")) {
+			uint64_t offset = str_to_size(argv[pos + 2]), size = str_to_size(argv[pos + 3]);
+			if (!size || offset > UINT64_MAX - size) ERR_EXIT("invalid read range\n");
+		} else if (!strcmp(command, "blk_size")) {
+			uint64_t size = str_to_size(argv[pos + 1]);
+			if (!size || size > 0xffff) ERR_EXIT("invalid block size\n");
+		} else if (!strcmp(command, "timeout")) bounded_decimal(argv[pos + 1], 1, 120000);
+		else if (!strcmp(command, "verbose")) bounded_decimal(argv[pos + 1], 0, 2);
+		pos += args + 1;
+	}
+	if (argc < 2) ERR_EXIT("no read-only commands supplied\n");
+}
+
+int main(int argc, char **argv) {
+#if USE_LIBUSB
+	libusb_device_handle *device;
+#else
+	int serial;
+#endif
+	spdio_t *io; int ret, i;
+	int wait = 30 * REOPEN_FREQ;
+	const char *tty = "/dev/ttyUSB0";
+	int verbose = 0, fdl_loaded = 0;
+	uint32_t chip_id = 0;
+	uint32_t fw_addr = ~0u, ram_addr = ~0u;
+	int keep_charge = 0, end_data = 1, blk_size = 0;
+	int secure_boot = 0;
+	int read_only = 0, check_commands = 0;
+
+#if USE_LIBUSB
+	(void)tty;
+#endif
+
+	while (argc > 1) {
+		if (!strcmp(argv[1], "--tty")) {
+			if (argc <= 2) ERR_EXIT("bad option\n");
+			tty = argv[2];
+			argc -= 2; argv += 2;
+		} else if (!strcmp(argv[1], "--wait")) {
+			if (argc <= 2) ERR_EXIT("bad option\n");
+			wait = bounded_decimal(argv[2], 0, 30) * REOPEN_FREQ;
+			argc -= 2; argv += 2;
+		} else if (!strcmp(argv[1], "--verbose")) {
+			if (argc <= 2) ERR_EXIT("bad option\n");
+			verbose = bounded_decimal(argv[2], 0, 2);
+			argc -= 2; argv += 2;
+		} else if (!strcmp(argv[1], "--read-only")) {
+			read_only = 1; argc--; argv++;
+		} else if (!strcmp(argv[1], "--check-commands")) {
+			check_commands = 1; argc--; argv++;
+		} else if (argv[1][0] == '-') {
+			ERR_EXIT("unknown option\n");
+		} else break;
+	}
+	if (argc < 2) ERR_EXIT("no commands supplied\n");
+	if (read_only) validate_readonly_commands(argc, argv);
+	if (check_commands) {
+		if (!read_only) ERR_EXIT("--check-commands requires --read-only\n");
+		puts("Read-only command sequence accepted; USB was not initialized.");
+		return 0;
+	}
+#if USE_LIBUSB
+	ret = libusb_init(NULL);
+	if (ret < 0) ERR_EXIT("libusb_init failed: %s\n", libusb_error_name(ret));
+#endif
+
+	for (i = 0; ; i++) {
+#if USE_LIBUSB
+		device = open_unique_device();
+		if (device) break;
+		if (i >= wait)
+			ERR_EXIT("libusb_open_device failed\n");
+#else
+		serial = open(tty, O_RDWR | O_NOCTTY | O_SYNC);
+		if (serial >= 0) break;
+		if (i >= wait)
+			ERR_EXIT("open(ttyUSB) failed\n");
+#endif
+		if (!i) DBG_LOG("Waiting for connection (%ds)\n", wait / REOPEN_FREQ);
+		usleep(1000000 / REOPEN_FREQ);
+	}
+
+#if USE_LIBUSB
+	io = spdio_init(device, 0);
+#else
+	io = spdio_init(serial, 0);
+#endif
+	io->flags |= FLAGS_TRANSCODE;
+	io->verbose = verbose;
+
+	while (argc > 1) {
+		if (!strcmp(argv[1], "fdl")) {
+			const char *fn; uint32_t addr;
+			if (argc <= 3) ERR_EXIT("bad command\n");
+
+			fn = argv[2];
+			addr = str_to_addr(argv[3], "ram", ram_addr);
+
+			if (!fdl_loaded) {
+				// Required for smartphones.
+				// Is there a way to do the same with usb-serial?
+#if USE_LIBUSB
+				ret = libusb_control_transfer(io->dev_handle,
+						0x21, 34, 0x601, 0, NULL, 0, io->timeout);
+				if (ret < 0)
+					ERR_EXIT("libusb_control_transfer failed : %s\n",
+							libusb_error_name(ret));
+#endif
+				/* Bootloader (chk = crc16) */
+				io->flags |= FLAGS_CRC16;
+
+				encode_msg(io, BSL_CMD_CHECK_BAUD, NULL, 1);
+				send_msg(io);
+				ret = recv_msg(io);
+				if (recv_type(io) != BSL_REP_VER)
+					ERR_EXIT("ver expected\n");
+
+				DBG_LOG("BSL_REP_VER: ");
+				print_string(stderr, io->raw_buf + 4, READ16_BE(io->raw_buf + 2));
+
+				if (READ16_BE(io->raw_buf + 2) != 6 ||
+						memcmp(io->raw_buf + 4, "SPRD3", 6))
+					secure_boot = 1;
+
+				encode_msg(io, BSL_CMD_CONNECT, NULL, 0);
+				send_and_check(io);
+
+				send_file(io, fn, addr, end_data,
+					blk_size ? blk_size : 528, 0, 0);
+
+				if (t117_exec_dist) {
+					t117_exec_workaround(io, addr);
+				} else {
+					encode_msg(io, BSL_CMD_EXEC_DATA, NULL, 0);
+					send_and_check(io);
+				}
+
+				/* FDL1 (chk = sum) */
+				io->flags &= ~FLAGS_CRC16;
+
+				encode_msg(io, BSL_CMD_CHECK_BAUD, NULL, 4);
+				for (i = 0; i < 10; i++) {
+					if (io->verbose >= 1)
+						DBG_LOG("checkbaud %d\n", i + 1);
+					send_msg(io);
+					ret = recv_msg(io);
+					if (ret) break;
+				}
+				if (recv_type(io) != BSL_REP_VER)
+					ERR_EXIT("ver expected\n");
+
+				{
+					char *str = (char*)io->raw_buf + 4;
+					int len = READ16_BE(io->raw_buf + 2);
+					DBG_LOG("BSL_REP_VER: ");
+					print_string(stderr, str, len);
+					if (len && !str[len - 1] && (str = strstr(str, "CHIP ID = 0x"))) {
+						uint32_t id = strtoul(str + 12, NULL, 16);
+						chip_id = id;
+						// SC6530, SC6530C, SC6531
+						if ((id ^ 0x65300000) >> 17 == 0)
+							ram_addr = (fw_addr = 0x30000000) | 0x04000000;
+						// SC6531E
+						else if ((id ^ 0x65620000) >> 16 == 0)
+							ram_addr = (fw_addr = 0x10000000) | 0x04000000;
+						// UMS9117
+						else if ((id ^ 0x98180000) >> 16 == 0) ram_addr = 0x80000000;
+					}
+				}
+
+				encode_msg(io, BSL_CMD_CONNECT, NULL, 0);
+				send_and_check(io);
+
+				if (keep_charge) {
+					encode_msg(io, BSL_CMD_KEEP_CHARGE, NULL, 0);
+					send_and_check(io);
+				}
+
+			} else {
+
+				send_file(io, fn, addr, end_data,
+					blk_size ? blk_size : 528, 0, 0);
+
+				encode_msg(io, BSL_CMD_EXEC_DATA, NULL, 0);
+				send_msg(io);
+				// Feature phones respond immediately,
+				// but it may take a second for a smartphone to respond.
+				ret = recv_msg_timeout(io, 15000);
+				if (!ret) ERR_EXIT("timeout reached\n");
+				ret = recv_type(io);
+				// Is it always bullshit?
+				if (ret == BSL_REP_INCOMPATIBLE_PARTITION)
+					DBG_LOG("FDL2: incompatible partition\n");
+				else if (ret != BSL_REP_ACK)
+					ERR_EXIT("unexpected response (0x%04x)\n", ret);
+			}
+
+			fdl_loaded++;
+			argc -= 3; argv += 3;
+
+		} else if (!strcmp(argv[1], "read_flash")) {
+			const char *fn; uint64_t addr, offset, size;
+			int mode = 0;
+			if (argc <= 5) ERR_EXIT("bad command\n");
+
+			addr = str_to_size(argv[2]);
+			offset = str_to_size(argv[3]);
+			if (!offset && !strcmp(argv[4], "auto")) mode = 1, size = 0;
+			else size = str_to_size(argv[4]);
+			fn = argv[5];
+			if ((addr | size | offset | (addr + offset + size)) >> 32)
+				ERR_EXIT("32-bit limit reached\n");
+			dump_flash(io, addr, offset, size, fn,
+					blk_size ? blk_size : 1024, mode);
+			argc -= 5; argv += 5;
+
+		} else if (!strcmp(argv[1], "write_word")) {
+			uint64_t addr, data; uint8_t buf[4];
+			if (argc <= 3) ERR_EXIT("bad command\n");
+
+			addr = str_to_addr(argv[2], "fw", fw_addr);
+			data = strtoull(argv[3], NULL, 0);
+			WRITE32_LE(buf, data);
+			if (addr >> 32)
+				ERR_EXIT("32-bit limit reached\n");
+#define CHECK_SECURE \
+	if (~fw_addr && secure_boot) \
+		if ((uint32_t)(addr - fw_addr) < 0x10000) \
+			ERR_EXIT("this operation will brick the phone, cancelled\n");
+			CHECK_SECURE
+			send_buf(io, addr, end_data, 528, buf, 4);
+			argc -= 3; argv += 3;
+
+		} else if (!strcmp(argv[1], "write_data")) {
+			const char *fn; uint64_t addr, offset, size;
+			if (argc <= 5) ERR_EXIT("bad command\n");
+
+			addr = str_to_addr(argv[2], "fw", fw_addr);
+			offset = str_to_size(argv[3]);
+			size = str_to_size(argv[4]);
+			fn = argv[5];
+			if ((addr | size | offset | (addr + size)) >> 32)
+				ERR_EXIT("32-bit limit reached\n");
+			CHECK_SECURE
+			send_file(io, fn, addr, end_data,
+				blk_size ? blk_size : 528, offset, size);
+			argc -= 5; argv += 5;
+
+		} else if (!strcmp(argv[1], "erase_flash")) {
+			uint64_t addr, size;
+			if (argc <= 3) ERR_EXIT("bad command\n");
+
+			addr = str_to_addr(argv[2], "fw", fw_addr);
+			size = str_to_size(argv[3]);
+			if ((addr | size | (addr + size)) >> 32)
+				ERR_EXIT("32-bit limit reached\n");
+			CHECK_SECURE
+			erase_flash(io, addr, size);
+			argc -= 3; argv += 3;
+
+		} else if (!strcmp(argv[1], "read_mem")) {
+			const char *fn; uint64_t addr, size;
+			if (argc <= 4) ERR_EXIT("bad command\n");
+
+			addr = str_to_size(argv[2]);
+			size = str_to_size(argv[3]);
+			fn = argv[4];
+			if ((addr | size | (addr + size)) >> 32)
+				ERR_EXIT("32-bit limit reached\n");
+			dump_mem(io, addr, size, fn,
+					blk_size ? blk_size : 1024);
+			argc -= 4; argv += 4;
+
+		} else if (!strcmp(argv[1], "part_size")) {
+			const char *name;
+			if (argc <= 2) ERR_EXIT("bad command\n");
+
+			name = argv[2];
+			find_partition_size(io, name);
+			argc -= 2; argv += 2;
+
+		} else if (!strcmp(argv[1], "read_part")) {
+			const char *name, *fn; uint64_t offset, size;
+			if (argc <= 5) ERR_EXIT("bad command\n");
+
+			name = argv[2];
+			offset = str_to_size(argv[3]);
+			size = str_to_size(argv[4]);
+			fn = argv[5];
+			if (offset + size < offset)
+				ERR_EXIT("64-bit limit reached\n");
+			dump_partition(io, name, offset, size, fn,
+					blk_size ? blk_size : 4096);
+			argc -= 5; argv += 5;
+
+		} else if (!strcmp(argv[1], "partition_list")) {
+			if (argc <= 2) ERR_EXIT("bad command\n");
+			partition_list(io, argv[2], 10);
+			argc -= 2; argv += 2;
+
+		} else if (!strcmp(argv[1], "partition_list_4k")) {
+			if (argc <= 2) ERR_EXIT("bad command\n");
+			partition_list(io, argv[2], 7);
+			argc -= 2; argv += 2;
+
+		} else if (!strcmp(argv[1], "repartition")) {
+			if (argc <= 2) ERR_EXIT("bad command\n");
+			repartition(io, argv[2]);
+			argc -= 2; argv += 2;
+
+		} else if (!strcmp(argv[1], "erase_part")) {
+			if (argc <= 2) ERR_EXIT("bad command\n");
+			erase_partition(io, argv[2]);
+			argc -= 2; argv += 2;
+
+		} else if (!strcmp(argv[1], "write_part")) {
+			if (argc <= 3) ERR_EXIT("bad command\n");
+			load_partition(io, argv[2], argv[3],
+					blk_size ? blk_size : 4096);
+			argc -= 3; argv += 3;
+
+		} else if (!strcmp(argv[1], "read_pactime")) {
+			read_pactime(io);
+			argc -= 1; argv += 1;
+
+		} else if (!strcmp(argv[1], "blk_size")) {
+			if (argc <= 2) ERR_EXIT("bad command\n");
+			{ uint64_t value = str_to_size(argv[2]);
+			if (!value || value > 0xffff) ERR_EXIT("invalid block size\n");
+			blk_size = (int)value; }
+			argc -= 2; argv += 2;
+
+		} else if (!strcmp(argv[1], "chip_uid")) {
+			encode_msg(io, BSL_CMD_READ_CHIP_UID, NULL, 0);
+			send_msg(io);
+			ret = recv_msg(io);
+			if ((ret = recv_type(io)) != BSL_REP_READ_CHIP_UID)
+				ERR_EXIT("unexpected response (0x%04x)\n", ret);
+
+			DBG_LOG("BSL_REP_READ_CHIP_UID: ");
+			print_string(stderr, io->raw_buf + 4, READ16_BE(io->raw_buf + 2));
+			argc -= 1; argv += 1;
+
+		} else if (!strcmp(argv[1], "read_efuse")) {
+			if (argc <= 2) ERR_EXIT("bad command\n");
+			dump_efuse(io, chip_id, argv[2]);
+			argc -= 2; argv += 2;
+
+		} else if (!strcmp(argv[1], "disable_transcode")) {
+			encode_msg(io, BSL_CMD_DISABLE_TRANSCODE, NULL, 0);
+			send_and_check(io);
+			io->flags &= ~FLAGS_TRANSCODE;
+			argc -= 1; argv += 1;
+
+		} else if (!strcmp(argv[1], "transcode")) {
+			unsigned a, f;
+			if (argc <= 2) ERR_EXIT("bad command\n");
+			a = atoi(argv[2]);
+			if (a >> 1) ERR_EXIT("bad command\n");
+			f = (io->flags & ~FLAGS_TRANSCODE);
+			io->flags = f | (a ? FLAGS_TRANSCODE : 0);
+			argc -= 2; argv += 2;
+
+		} else if (!strcmp(argv[1], "keep_charge")) {
+			if (argc <= 2) ERR_EXIT("bad command\n");
+			keep_charge = atoi(argv[2]);
+			argc -= 2; argv += 2;
+
+		} else if (!strcmp(argv[1], "timeout")) {
+			if (argc <= 2) ERR_EXIT("bad command\n");
+			io->timeout = bounded_decimal(argv[2], 1, 120000);
+			argc -= 2; argv += 2;
+
+		} else if (!strcmp(argv[1], "end_data")) {
+			if (argc <= 2) ERR_EXIT("bad command\n");
+			end_data = atoi(argv[2]);
+			argc -= 2; argv += 2;
+
+		} else if (!strcmp(argv[1], "reset")) {
+			encode_msg(io, BSL_CMD_NORMAL_RESET, NULL, 0);
+			send_and_check(io);
+			argc -= 1; argv += 1;
+
+		} else if (!strcmp(argv[1], "power_off")) {
+			encode_msg(io, BSL_CMD_POWER_OFF, NULL, 0);
+			send_and_check(io);
+			argc -= 1; argv += 1;
+
+		} else if (!strcmp(argv[1], "t117_exec_dist")) {
+			if (argc <= 2) ERR_EXIT("bad command\n");
+			t117_exec_dist = strtol(argv[2], NULL, 0);
+			argc -= 2; argv += 2;
+
+		} else if (!strcmp(argv[1], "verbose")) {
+			if (argc <= 2) ERR_EXIT("bad command\n");
+			io->verbose = atoi(argv[2]);
+			argc -= 2; argv += 2;
+
+		} else {
+			ERR_EXIT("unknown command\n");
+		}
+	}
+
+	spdio_free(io);
+#if USE_LIBUSB
+	libusb_exit(NULL);
+#endif
+	return 0;
+}

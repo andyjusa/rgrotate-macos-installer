@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+.DS_Store
+.venv/
+build/
+runs/
+backups/
+.local/
+*.pac
+*.img
+*.bin
+*.7z*
+*.zip
+*.tar*
+vendor/spreadtrum_flash/spd_dump
+vendor/spreadtrum_flash/protocol_tests
+*.dSYM/

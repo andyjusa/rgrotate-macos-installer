@@ -1,0 +1,9 @@
+Format reference: https://github.com/bismoy-bot/PAC-Extractor
+Commit: 7d4e59b6a5ba86a7ea4e8c42d9c5f229037a6893
+Consulted file: extractor.py
+Retrieved: 2026-10-07
+
+The PAC field layout was checked against this MIT-licensed reference.
+The rgrotate parser is independently implemented with Python standard-library
+code; no upstream extractor implementation is bundled. The upstream LICENSE
+and README.md are preserved here verbatim for provenance and attribution.
