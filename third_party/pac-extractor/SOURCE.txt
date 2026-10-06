@@ -4,6 +4,6 @@ Consulted file: extractor.py
 Retrieved: 2026-10-07
 
 The PAC field layout was checked against this MIT-licensed reference.
-The rgrotate parser is independently implemented with Python standard-library
-code; no upstream extractor implementation is bundled. The upstream LICENSE
+The rgrotate parser was independently implemented and subsequently ported to
+Rust; no upstream extractor implementation is bundled. The upstream LICENSE
 and README.md are preserved here verbatim for provenance and attribution.

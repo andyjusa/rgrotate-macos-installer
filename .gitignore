@@ -15,3 +15,4 @@ backups/
 vendor/spreadtrum_flash/spd_dump
 vendor/spreadtrum_flash/protocol_tests
 *.dSYM/
+/target/

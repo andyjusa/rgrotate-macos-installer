@@ -1,0 +1,33 @@
+name: Rust and native backend
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Select stable Rust
+        run: |
+          rustup update stable --no-self-update
+          rustup default stable
+          rustup component add rustfmt clippy
+      - name: Install native build dependencies
+        run: brew install pkg-config libusb
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Rust regression tests
+        run: cargo test --locked
+      - name: Rust lint
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Native protocol regressions (no USB)
+        run: make -C vendor/spreadtrum_flash test
+      - name: Build native executables
+        run: sh scripts/build-macos.sh

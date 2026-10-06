@@ -1,13 +1,14 @@
 # RG Rotate macOS Installer
 
-Community tooling for using an Anbernic RG Rotate PAC firmware package on macOS.
+Native Rust tooling for using an Anbernic RG Rotate PAC firmware package on macOS.
+The CLI, PAC parser, validation, and installation runner require no Python runtime.
+USB packets are handled by the existing audited C/libusb backend.
 This project follows the Unisoc BootROM/FDL transport used by PAC installers.
 It is independent of Anbernic and GammaOS and is not an official macOS release.
 
-**Development preview: native macOS BootROM/FDL communication and the read-only
-probe have succeeded on an RG Rotate. A narrowly scoped clean Full conversion
-is experimental; its storage writes and first-boot recovery reset have
-not yet been verified on hardware.**
+**Development preview: the native C backend has communicated with an RG Rotate
+using BootROM/FDL. The Rust orchestration is tested offline; its complete physical
+installation and recovery-reset workflow remains experimental.**
 
 ## Current capabilities
 
@@ -19,6 +20,8 @@ not yet been verified on hardware.**
 - Build a native libusb backend on macOS.
 - Run an explicit read-only probe: execute the package's FDL loaders in RAM,
   read the partition table and the first 1 MiB of `boot_a`, then power off.
+- Install the pinned Full image on a compatible existing layout with complete
+  readback checks, then request a Recovery factory reset.
 - Refuse unsupported or ambiguous destructive operations before device writes.
 
 The probe does not erase, repartition, or write device storage. Executing an
@@ -28,17 +31,19 @@ alone does not establish device identity or flashing compatibility.
 
 ## Build and inspect
 
-Requirements: macOS, Xcode Command Line Tools, Python 3.10+, `pkg-config`, and
-`libusb`.
+Requirements: macOS, Xcode Command Line Tools, Rust/Cargo 1.85 or newer,
+`pkg-config`, and `libusb`. Install Rust from [rustup](https://rustup.rs).
 
 ```sh
 brew install pkg-config libusb
 sh scripts/build-macos.sh
-python3 -m unittest discover -s tests -v
-python3 -m rgrotate plan /path/to/official-firmware.pac
+cargo test --locked
+make -C vendor/spreadtrum_flash test
+./build/rgrotate plan /path/to/official-firmware.pac
 ```
 
-The Python inspection commands use only the standard library. Firmware,
+The build produces `build/rgrotate` and `build/spd_dump`. Offline plan inspection
+uses only the Rust binary; device commands explicitly select the backend. Firmware,
 passwords, downloaded archives, and device backups are not distributed.
 Obtain your own firmware from the
 [official RG Rotate release](https://github.com/TheGammaSqueeze/GammaOSNext/releases/tag/v1.4.1-ANBERNICRGROTATE).
@@ -47,7 +52,8 @@ Obtain your own firmware from the
 
 Validated on Apple Silicon macOS during development:
 
-- Offline Python regressions, including comparison of all 71 entries in the 6.67 GB
+- Rust parser, planner, validation, CLI, and subprocess-runner regressions.
+- Optional real-firmware integration compares all 71 entries in the 6.67 GB
   GammaOS Full v1.4.1 PAC with an independent manifest.
 - Native backend build with warnings treated as errors.
 - Mock USB/protocol tests under AddressSanitizer and UndefinedBehaviorSanitizer:
@@ -55,22 +61,29 @@ Validated on Apple Silicon macOS during development:
   multiple-device rejection, and streaming failures.
 - Offline command classification accepts the probe sequence and rejects a
   destructive command under `--read-only` before USB initialization.
-- Actual BootROM/FDL loader execution, partition-table retrieval, and a bounded
-  `boot_a` read through the native macOS backend on an RG Rotate.
+- Actual BootROM/FDL loader execution, preflight reads, Full `super`, four
+  A-side vbmeta images, and patched `misc` writes through the native macOS
+  backend with the prior Python orchestrator. All six complete readbacks
+  matched their expected SHA-256 hashes and power-off succeeded. This does
+  not establish Rust orchestration or Recovery/Android boot validation.
 
-The clean Full conversion's storage-write sequence, complete image readbacks,
-and recovery factory reset remain unverified on hardware. A successful probe
-does not establish those outcomes. Firmware integration tests require local
+The Rust clean Full conversion and recovery factory reset remain unverified on
+hardware. Native-backend results and offline Rust tests are recorded separately;
+a successful probe does not establish the complete install outcome.
+Firmware integration tests require local
 `RGROTATE_TEST_PAC` and `RGROTATE_TEST_MANIFEST` paths; those inputs are not
-distributed.
+distributed. `RGROTATE_TEST_PLAN` optionally supplies an independent reference
+plan JSON. `RGROTATE_TEST_PREFLIGHT` optionally points to complete saved preflight
+reads, including `before/` and `images/misc.bin`, for validation and BCB parity
+checks. All these integration tests read local files and never open USB.
 
 ## Read-only USB probe
 
 Prepare a fresh output directory. The command refuses an existing directory.
 
 ```sh
-python3 -m rgrotate probe /path/to/official-firmware.pac \
-  --backend ./build/spd_dump --out ./runs/probe-001 --wait 30
+./build/rgrotate probe /path/to/official-firmware.pac \
+  --backend ./build/spd_dump --out ./runs/probe-001 --wait 120
 ```
 
 For the RG Rotate, remove the microSD, power the device off, open the sliding
@@ -102,9 +115,9 @@ Use a new output directory. An existing directory is refused, so an interrupted
 run cannot silently overwrite its pre-write backups or verification evidence.
 
 ```sh
-python3 -m rgrotate flash /path/to/official-v1.4.1-full.pac \
+./build/rgrotate flash /path/to/official-v1.4.1-full.pac \
   --flash --preserve-layout --wipe-data \
-  --backend ./build/spd_dump --out ./runs/install-001 --wait 30
+  --backend ./build/spd_dump --out ./runs/install-001 --wait 120
 ```
 
 Keep the device disconnected while the tool checks the pinned Full images,

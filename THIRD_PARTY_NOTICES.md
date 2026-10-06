@@ -26,8 +26,8 @@ for the RG Rotate preview's supported workflow and limitations.
 - Reference records: `third_party/pac-extractor`
 
 The field layout documented in upstream `extractor.py` was consulted when
-implementing the Python PAC reader. The reader and its regression tests were
-independently written for this project. The upstream extraction script is not
+implementing the original PAC reader, subsequently ported to Rust. The reader
+and its regression tests were independently written for this project. The upstream extraction script is not
 bundled; its license and README are preserved verbatim with a pinned source
 record.
 
@@ -41,3 +41,9 @@ the dependency separately as described in the root README.
 
 Firmware archives, partition images, device backups, and vendor FDL loader
 binaries are not included. Their licensing is separate from this project.
+
+## Rust dependencies
+
+Cargo dependencies and their exact versions are recorded in `Cargo.lock`. Their
+upstream licenses apply independently of this repository's MIT license. Cargo
+downloads these crates from crates.io; their source is not vendored here.

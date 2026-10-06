@@ -1,0 +1,37 @@
+[package]
+name = "rgrotate-macos-installer"
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Guarded native macOS PAC inspection and FDL installation for RG Rotate"
+license = "MIT"
+repository = "https://github.com/andyjusa/rgrotate-macos-installer"
+default-run = "rgrotate"
+
+[lib]
+name = "rgrotate"
+path = "src/lib.rs"
+
+[[bin]]
+name = "rgrotate"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4.6", features = ["derive"] }
+crc32fast = "1"
+hex = "0.4"
+libc = "0.2"
+regex = "1"
+roxmltree = "0.21"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+sha2 = "0.11"
+signal-hook = "0.4"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = "thin"
+strip = true

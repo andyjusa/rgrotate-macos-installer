@@ -1,1 +1,0 @@
-"""RG Rotate macOS tooling."""
